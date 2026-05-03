@@ -2,7 +2,7 @@
 
 Thymer plugin that treats `==highlighted text==` like Obsidian-style markers: it turns those segments into soft yellow highlight links in the editor. Thymer does not ship a native highlight segment type, so the plugin stores highlights as styled link segments and injects matching CSS.
 
-**Version:** `version` in `plugin.json` is the plugin release (e.g. `1.0.0`). The `ver` field is the manifest / API version expected by Thymer.
+**Version:** `version` in `plugin.json` is the plugin release (e.g. `1.0.0a`). The `ver` field is the manifest / API version expected by Thymer.
 
 ## Features
 
@@ -10,7 +10,7 @@ Thymer plugin that treats `==highlighted text==` like Obsidian-style markers: it
 - **Multi-line highlights** — Highlights can span consecutive compatible lines; the plugin chains them when possible.
 - **Escaping** — Use `\` so `\\==` and `\\=` emit literal `==` and `=`, and `\\==` can block a pair from being treated as a delimiter.
 - **Scan on load** — Opening a note, focusing the editor, or reloading the plugin reapplies highlighting to existing `==…==` in the open page.
-- **Command palette** — Unwrap highlights to plain text or restore `==` markers, for the whole note or for lines tied to your last text selection (see below).
+- **Command palette** — Unwrap highlights to plain text or restore `==` markers, for the whole note or for the **current selection** (see below).
 
 ## Writing highlights
 
@@ -29,11 +29,11 @@ Open the command palette and search for:
 | Command | Effect |
 |--------|--------|
 | **Unwrap == highlights to plain text (this note)** | Removes highlight links for every line in the open note. |
-| **Unwrap == highlights to plain text (lines from last text drag)** | Same, but only for lines detected from your recent text drag / selection heuristics. |
+| **Unwrap == highlights to plain text (current selection)** | Same, but only for lines detected from the current editor selection (cached after focus moves). |
 | **Restore == markers from highlights (this note)** | Turns highlight links back into `==…==` text for the whole note. |
-| **Restore == markers from highlights (lines from last text drag)** | Same, scoped to the last text-drag lines. |
+| **Restore == markers from highlights (current selection)** | Same, scoped to the current selection. |
 
-Selection-scoped commands infer rows using the last editor text drag, cached selection geometry, and related signals so they still work after the palette takes focus.
+Selection-scoped commands infer rows using the selection, cached geometry, pointer band, and related signals so they still work after the palette takes focus.
 
 ## Installation
 

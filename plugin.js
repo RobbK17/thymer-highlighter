@@ -7,15 +7,15 @@
  * Multi-line ==…== is supported across consecutive single-segment lines of the same type (text/bold/italic).
  * Within one line, consecutive text/bold/italic segments are parsed together so == survives Thymer splitting **…**.
  *
- * “Selected lines” matches Thymer’s text workflow: we keep the line GUIDs for the last non‑collapsed mouse
- * drag (same selection used for right‑click bold) in _lastTextSelectionLineGuids so the command palette can
- * still target those lines after focus moves. Also pointer band, geometry, and other heuristics.
+ * “Selected lines” matches Thymer’s text workflow: we keep the line GUIDs for the current editor
+ * selection (cached when focus moves, e.g. to the command palette) in _lastTextSelectionLineGuids using
+ * pointer bands, geometry, frozen ranges, and related heuristics.
  *
  * For the Thymer SDK hot-reload workflow, add `export` before `class Plugin` if your bundler requires it.
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.0";
+const PLUGIN_VERSION = "1.0.0a";
 
 const HIGHLIGHT_LINK = "https://thymer.invalid/highlight";
 
@@ -2240,7 +2240,7 @@ async function captureTextSelectionLinesForCommands(plugin, panel) {
 }
 
 /**
- * Best-effort: last text drag, event cache, record/ui APIs, line-item flags, panel APIs, navigation, DOM, caret.
+ * Best-effort: current selection (cached), event cache, record/ui APIs, line-item flags, panel APIs, navigation, DOM, caret.
  * @returns {Set<string>|null} null if nothing detected
  */
 function getSelectedLineItemGuidSet(panel, items, plugin, record) {
@@ -2361,7 +2361,7 @@ class Plugin extends AppPlugin {
 			},
 		});
 		this._cmdUnwrapPlainSel = this.ui.addCommandPaletteCommand({
-			label: "Unwrap == highlights to plain text (lines from last text drag)",
+			label: "Unwrap == highlights to plain text (current selection)",
 			icon: "eraser",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("plain", "selection");
@@ -2375,7 +2375,7 @@ class Plugin extends AppPlugin {
 			},
 		});
 		this._cmdUnwrapMarkersSel = this.ui.addCommandPaletteCommand({
-			label: "Restore == markers from highlights (lines from last text drag)",
+			label: "Restore == markers from highlights (current selection)",
 			icon: "refresh",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("markers", "selection");

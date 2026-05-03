@@ -1,6 +1,6 @@
 {
 	"ver": 1,
-	"version": "1.0.0",
+	"version": "1.0.0a",
 	"name": "== Highlight",
 	"icon": "highlight",
 	"description": "Turns ==highlighted text== into soft yellow highlights in the editor (Obsidian-style markers)."
