@@ -15,7 +15,37 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.0a";
+const PLUGIN_VERSION = "1.0.1";
+
+const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
+
+function localStorageKeyHighlightDetection(plugin) {
+	try {
+		const g = plugin?.getGuid?.();
+		return g ? `${LS_KEY_HIGHLIGHT_DETECTION}:${g}` : LS_KEY_HIGHLIGHT_DETECTION;
+	} catch (_) {
+		return LS_KEY_HIGHLIGHT_DETECTION;
+	}
+}
+
+/** @returns {boolean} default true */
+function readHighlightDetectionEnabled(plugin) {
+	try {
+		if (typeof localStorage === "undefined") return true;
+		const v = localStorage.getItem(localStorageKeyHighlightDetection(plugin));
+		if (v == null) return true;
+		return v !== "0" && v !== "false";
+	} catch (_) {
+		return true;
+	}
+}
+
+function persistHighlightDetectionEnabled(plugin, enabled) {
+	try {
+		if (typeof localStorage === "undefined") return;
+		localStorage.setItem(localStorageKeyHighlightDetection(plugin), enabled ? "1" : "0");
+	} catch (_) {}
+}
 
 const HIGHLIGHT_LINK = "https://thymer.invalid/highlight";
 
@@ -2345,6 +2375,7 @@ class Plugin extends AppPlugin {
 		this._lastNonCollapsedSelectionUnion = null;
 		this._lastVerticalSelectBand = null;
 		this._selectionGuidsFromEventClearT = 0;
+		this._highlightDetectionEnabled = readHighlightDetectionEnabled(this);
 		injectHighlightStyles(this.ui);
 		const opts = { collection: "*" };
 		const onLine = (ev) => {
@@ -2354,31 +2385,58 @@ class Plugin extends AppPlugin {
 		this._handlerUpdated = this.events.on("lineitem.updated", onLine, opts);
 
 		this._cmdUnwrapPlainWhole = this.ui.addCommandPaletteCommand({
-			label: "Unwrap == highlights to plain text (this note)",
+			label: "Highlighter: Unwrap == convert to text (this note)",
 			icon: "eraser",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("plain", "whole");
 			},
 		});
 		this._cmdUnwrapPlainSel = this.ui.addCommandPaletteCommand({
-			label: "Unwrap == highlights to plain text (current selection)",
+			label: "Highlighter: Unwrap == convert to text (current selection)",
 			icon: "eraser",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("plain", "selection");
 			},
 		});
 		this._cmdUnwrapMarkersWhole = this.ui.addCommandPaletteCommand({
-			label: "Restore == markers from highlights (this note)",
+			label: "Highlighter: Restore == convert to markers (this note)",
 			icon: "refresh",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("markers", "whole");
 			},
 		});
 		this._cmdUnwrapMarkersSel = this.ui.addCommandPaletteCommand({
-			label: "Restore == markers from highlights (current selection)",
+			label: "Highlighter: Restore == convert to markers (current selection)",
 			icon: "refresh",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("markers", "selection");
+			},
+		});
+		this._cmdEnableHighlightDetection = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: Enable == highlight auto-detection",
+			icon: "highlight",
+			onSelected: () => {
+				if (this._highlightDetectionEnabled) return;
+				this._highlightDetectionEnabled = true;
+				persistHighlightDetectionEnabled(this, true);
+				const panel = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
+				void this._scanRecordLineItemsForHighlights(panel);
+			},
+		});
+		this._cmdDisableHighlightDetection = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: Disable == highlight auto-detection",
+			icon: "ban",
+			onSelected: () => {
+				if (!this._highlightDetectionEnabled) return;
+				this._highlightDetectionEnabled = false;
+				persistHighlightDetectionEnabled(this, false);
+			},
+		});
+		this._cmdRestoreMarkersAllWorkspace = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: Restore all == convert all notes to markers",
+			icon: "refresh",
+			onSelected: () => {
+				void this._restoreMarkersInAllWorkspaceRecords();
 			},
 		});
 
@@ -2393,6 +2451,7 @@ class Plugin extends AppPlugin {
 		this._handlerPanelNavigated = this.events.on("panel.navigated", onPanel);
 		this._handlerPanelFocused = this.events.on("panel.focused", onPanel);
 		this._handlerReload = this.events.on("reload", () => {
+			this._highlightDetectionEnabled = readHighlightDetectionEnabled(this);
 			this._lastTextSelectionLineGuids = new Set();
 			this._frozenTextSelection = null;
 			this._lastNonCollapsedSelectionUnion = null;
@@ -2495,6 +2554,9 @@ class Plugin extends AppPlugin {
 		this._cmdUnwrapPlainSel?.remove();
 		this._cmdUnwrapMarkersWhole?.remove();
 		this._cmdUnwrapMarkersSel?.remove();
+		this._cmdEnableHighlightDetection?.remove();
+		this._cmdDisableHighlightDetection?.remove();
+		this._cmdRestoreMarkersAllWorkspace?.remove();
 		for (const tid of this._markerRestoreSkipClearTimeouts || []) clearTimeout(tid);
 		this._markerRestoreSkipClearTimeouts = [];
 		clearTimeout(this._selectionGuidsFromEventClearT);
@@ -2521,6 +2583,90 @@ class Plugin extends AppPlugin {
 			this._selSnapRaf = 0;
 			const p = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
 			void snapshotEditorSelectionInto(this, p);
+		});
+	}
+
+	/**
+	 * @param {Array<{ guid: string, segments: object }>} targets line items to transform
+	 * @param {"plain" | "markers"} mode
+	 * @returns {Promise<{ markerGuids: string[] }>}
+	 */
+	async _unwrapTargetsToMode(targets, mode) {
+		const markerGuids = [];
+		for (const item of targets) {
+			const next = transformSegmentsUnwrap(item.segments, mode);
+			if (!next) continue;
+			if (mode === "markers") {
+				this._skipHighlightOnce.add(item.guid);
+				markerGuids.push(item.guid);
+			}
+			await item.setSegments(next);
+		}
+		return { markerGuids };
+	}
+
+	_scheduleMarkerSkipClear(markerGuids) {
+		if (!markerGuids?.length) return;
+		const list = markerGuids.slice();
+		const tid = setTimeout(() => {
+			const arr = this._markerRestoreSkipClearTimeouts;
+			const ix = arr.indexOf(tid);
+			if (ix !== -1) arr.splice(ix, 1);
+			for (const g of list) this._skipHighlightOnce.delete(g);
+		}, 220);
+		this._markerRestoreSkipClearTimeouts.push(tid);
+	}
+
+	/** Every record in the workspace: highlight links → ==markers== (same as per-note “convert to markers”). */
+	async _restoreMarkersInAllWorkspaceRecords() {
+		let records;
+		try {
+			records = this.data.getAllRecords?.();
+		} catch (_) {
+			this.ui.addToaster({
+				title: "Highlighter",
+				message: "Could not read workspace notes.",
+				dismissible: true,
+				autoDestroyTime: 5000,
+			});
+			return;
+		}
+		if (!records?.length) {
+			this.ui.addToaster({
+				title: "Highlighter",
+				message: "No notes found in this workspace.",
+				dismissible: true,
+				autoDestroyTime: 5000,
+			});
+			return;
+		}
+		const allMarkerGuids = [];
+		let recordsConverted = 0;
+		for (const record of records) {
+			try {
+				let items = await record.getLineItems(false);
+				await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
+				items = await record.getLineItems(false);
+				const { markerGuids } = await this._unwrapTargetsToMode(items, "markers");
+				if (markerGuids.length) recordsConverted++;
+				for (const g of markerGuids) allMarkerGuids.push(g);
+			} catch (_) {}
+		}
+		this._scheduleMarkerSkipClear(allMarkerGuids);
+		const totalReviewed = records.length;
+		const reviewedPhrase =
+			totalReviewed === 1 ? "Reviewed 1 note." : `Reviewed ${totalReviewed} notes.`;
+		const changedPhrase =
+			recordsConverted === 0
+				? "No highlight links were converted to == markers."
+				: recordsConverted === 1
+					? "Converted highlight links to == markers in 1 note."
+					: `Converted highlight links to == markers in ${recordsConverted} notes.`;
+		this.ui.addToaster({
+			title: "Highlighter",
+			message: `${reviewedPhrase} ${changedPhrase}`,
+			dismissible: true,
+			autoDestroyTime: 7500,
 		});
 	}
 
@@ -2553,35 +2699,12 @@ class Plugin extends AppPlugin {
 		const targets =
 			scope === "whole" ? items : items.filter((it) => selectedSet.has(it.guid));
 
-		const unwrapPlans = targets.map((item) => ({
-			item,
-			next: transformSegmentsUnwrap(item.segments, mode),
-		}));
-		let n = 0;
-		const markerRestoreGuids = [];
-		for (const { item, next } of unwrapPlans) {
-			if (!next) continue;
-			if (mode === "markers") {
-				this._skipHighlightOnce.add(item.guid);
-				markerRestoreGuids.push(item.guid);
-			}
-			await item.setSegments(next);
-			n++;
-		}
-		if (mode === "markers" && markerRestoreGuids.length) {
-			const guids = markerRestoreGuids.slice();
-			const tid = setTimeout(() => {
-				const arr = this._markerRestoreSkipClearTimeouts;
-				const ix = arr.indexOf(tid);
-				if (ix !== -1) arr.splice(ix, 1);
-				for (const g of guids) this._skipHighlightOnce.delete(g);
-			}, 220);
-			this._markerRestoreSkipClearTimeouts.push(tid);
-		}
+		const { markerGuids } = await this._unwrapTargetsToMode(targets, mode);
+		if (mode === "markers" && markerGuids.length) this._scheduleMarkerSkipClear(markerGuids);
 	}
 
 	async _processLineItemHighlight(lineItem, segmentsPreferred) {
-		if (!lineItem) return;
+		if (!lineItem || !this._highlightDetectionEnabled) return;
 		if (this._skipHighlightOnce.has(lineItem.guid)) return;
 		let segments = segmentsPreferred ?? lineItem.segments;
 		if (!segments || !segments.length) return;
@@ -2609,7 +2732,7 @@ class Plugin extends AppPlugin {
 		}
 
 		const record = ev.getRecord();
-		if (record) await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
+		if (this._highlightDetectionEnabled && record) await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
 
 		const lineItem = await ev.getLineItem();
 		if (!lineItem) return;
@@ -2623,6 +2746,7 @@ class Plugin extends AppPlugin {
 	}
 
 	async _scanRecordLineItemsForHighlights(panel) {
+		if (!this._highlightDetectionEnabled) return;
 		if (!panel || panel.getType() !== PANEL_TYPE_EDITOR) return;
 		const record = panel.getActiveRecord();
 		if (!record) return;
