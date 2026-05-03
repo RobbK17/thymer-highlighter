@@ -6,6 +6,8 @@
  * \\ escapes backslash; \\== and \\= emit literal == and =; \\== prevents a pair from being a delimiter.
  * Multi-line ==…== is supported across consecutive single-segment lines of the same type (text/bold/italic).
  * Within one line, consecutive text/bold/italic segments are parsed together so == survives Thymer splitting **…**.
+ * A pair must be real == inside one segment (not one = at the end of a segment and the next at the start of the next).
+ * Syntax blocks skip conversion: rows with `getHighlightLanguage`, children of a `block` row with `meta_properties.language`, and Thymer `quote` (email blockquote) rows; inline `code` segments were already skipped.
  *
  * “Selected lines” matches Thymer’s text workflow: we keep the line GUIDs for the current editor
  * selection (cached when focus moves, e.g. to the command palette) in _lastTextSelectionLineGuids using
@@ -15,7 +17,7 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.1";
+const PLUGIN_VERSION = "1.0.3";
 
 const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
 
@@ -45,6 +47,72 @@ function persistHighlightDetectionEnabled(plugin, enabled) {
 		if (typeof localStorage === "undefined") return;
 		localStorage.setItem(localStorageKeyHighlightDetection(plugin), enabled ? "1" : "0");
 	} catch (_) {}
+}
+
+/**
+ * When true, “All notes: literal ==…” only scans and toasts/logs results — no setSegments, no cross-line rewrites.
+ * Toggle in devtools: localStorage.setItem("thymerHighlighter:workspaceMarkdownExportDryRun", "1")
+ * Clear: removeItem or set "0".
+ */
+const LS_KEY_WORKSPACE_MARKDOWN_EXPORT_DRY_RUN = "thymerHighlighter:workspaceMarkdownExportDryRun";
+
+function readWorkspaceMarkdownExportDryRun() {
+	try {
+		if (typeof localStorage === "undefined") return false;
+		const v = localStorage.getItem(LS_KEY_WORKSPACE_MARKDOWN_EXPORT_DRY_RUN);
+		return v === "1" || v === "true";
+	} catch (_) {
+		return false;
+	}
+}
+
+/**
+ * Browser-local index of record GUIDs that currently contain plugin highlight link segments.
+ * Not stored on Thymer records (no invisible server field in AppPlugin SDK); does not sync across devices.
+ * See README + palette command “Rebuild local index…”.
+ */
+const LS_KEY_RECORDS_WITH_HIGHLIGHTS = "thymerHighlighter:recordsWithHighlights:v1";
+const RECORD_HIGHLIGHT_INDEX_DEBOUNCE_MS = 480;
+
+function loadRecordsWithHighlightsMap() {
+	if (typeof localStorage === "undefined") return {};
+	try {
+		const raw = localStorage.getItem(LS_KEY_RECORDS_WITH_HIGHLIGHTS);
+		if (!raw) return {};
+		const o = JSON.parse(raw);
+		return o && typeof o === "object" ? o : {};
+	} catch (_) {
+		return {};
+	}
+}
+
+function persistRecordsWithHighlightsMap(all) {
+	try {
+		if (typeof localStorage === "undefined") return;
+		localStorage.setItem(LS_KEY_RECORDS_WITH_HIGHLIGHTS, JSON.stringify(all));
+	} catch (_) {}
+}
+
+function setWorkspaceRecordHasHighlightLinks(plugin, recordGuid, has) {
+	const ws = String(plugin?.getWorkspaceGuid?.() ?? "").trim();
+	const rg = String(recordGuid ?? "").trim();
+	if (!ws || !rg || typeof localStorage === "undefined") return;
+	const all = loadRecordsWithHighlightsMap();
+	if (!all[ws] || typeof all[ws] !== "object") all[ws] = {};
+	if (has) all[ws][rg] = Date.now();
+	else delete all[ws][rg];
+	if (!has && all[ws] && !Object.keys(all[ws]).length) delete all[ws];
+	persistRecordsWithHighlightsMap(all);
+}
+
+/** @returns {string[]} record GUIDs marked in {@link LS_KEY_RECORDS_WITH_HIGHLIGHTS} for the current workspace */
+function getWorkspaceHighlightRecordGuids(plugin) {
+	const ws = String(plugin?.getWorkspaceGuid?.() ?? "").trim();
+	if (!ws) return [];
+	const all = loadRecordsWithHighlightsMap();
+	const m = all[ws];
+	if (!m || typeof m !== "object") return [];
+	return Object.keys(m);
 }
 
 const HIGHLIGHT_LINK = "https://thymer.invalid/highlight";
@@ -89,8 +157,28 @@ function findNextUnescapedEqEq(str, from) {
 	return -1;
 }
 
+/**
+ * Like findNextUnescapedEqEq, but only when both "=" come from the same Thymer segment (`map` index).
+ * Prevents `foo=` + `=bar` from forming a false `==` pair across a segment boundary (real pairs are `==…==` in one cell or wholly inside one segment).
+ * @param {{ si: number }[]} map from buildRunCombined
+ */
+function findNextUnescapedEqEqInRun(str, from, map) {
+	for (let p = from; p <= str.length - 2; p++) {
+		if (str[p] !== "=" || str[p + 1] !== "=" || isEqEqEscaped(str, p)) continue;
+		const a = map[p];
+		const b = map[p + 1];
+		if (!a || !b || a.si !== b.si || a.si < 0) continue;
+		return p;
+	}
+	return -1;
+}
+
 function containsUnescapedEqEq(str) {
 	return findNextUnescapedEqEq(str, 0) !== -1;
+}
+
+function containsUnescapedEqEqInRun(str, map) {
+	return findNextUnescapedEqEqInRun(str, 0, map) !== -1;
 }
 
 /** Turn user escapes into literal characters (after == delimiters are stripped). */
@@ -116,17 +204,21 @@ function unescapeText(str) {
 	return out;
 }
 
-function splitByHighlightMarkerRanges(str) {
+function splitByHighlightMarkerRanges(str, map) {
 	const ranges = [];
 	let i = 0;
 	while (i < str.length) {
-		const open = findNextUnescapedEqEq(str, i);
+		const open = map
+			? findNextUnescapedEqEqInRun(str, i, map)
+			: findNextUnescapedEqEq(str, i);
 		if (open === -1) {
 			if (i < str.length) ranges.push({ kind: "text", start: i, end: str.length });
 			break;
 		}
 		if (open > i) ranges.push({ kind: "text", start: i, end: open });
-		const close = findNextUnescapedEqEq(str, open + 2);
+		const close = map
+			? findNextUnescapedEqEqInRun(str, open + 2, map)
+			: findNextUnescapedEqEq(str, open + 2);
 		if (close === -1) {
 			ranges.push({ kind: "text", start: open, end: str.length });
 			break;
@@ -223,17 +315,19 @@ function emitTextSubrangesFromRun(run, combined, map, rs, re, out) {
 function expandSplittableRun(run) {
 	if (run.length === 1) return expandSegment(run[0]);
 	const { combined, map } = buildRunCombined(run);
-	if (!containsUnescapedEqEq(combined)) {
+	if (!containsUnescapedEqEqInRun(combined, map)) {
 		return run.map((s) => ({ type: s.type, text: s.text }));
 	}
-	const ranges = splitByHighlightMarkerRanges(combined);
+	const ranges = splitByHighlightMarkerRanges(combined, map);
 	const out = [];
 	for (const r of ranges) {
 		if (r.start >= r.end) continue;
 		if (r.kind === "highlight") {
 			const m0 = map[r.start];
 			const st =
-				m0 && (run[m0.si].type === "text" || run[m0.si].type === "bold" || run[m0.si].type === "italic")
+				m0 &&
+				m0.si >= 0 &&
+				(run[m0.si].type === "text" || run[m0.si].type === "bold" || run[m0.si].type === "italic")
 					? run[m0.si].type
 					: "text";
 			out.push({
@@ -265,8 +359,8 @@ function mightContainHighlightSyntax(segments) {
 			run.push(segments[j]);
 			j++;
 		}
-		const combined = run.map((s) => String(s.text ?? "")).join("");
-		if (containsUnescapedEqEq(combined)) return true;
+		const { combined, map } = buildRunCombined(run);
+		if (containsUnescapedEqEqInRun(combined, map)) return true;
 		i = j;
 	}
 	return false;
@@ -328,13 +422,194 @@ function segmentsDiffer(a, b) {
 	return false;
 }
 
+/**
+ * True only for this plugin’s sentinel URL (exact or normalized), not longer paths that merely start with it.
+ */
+function linkobjHrefIsOurHighlightUrl(seg) {
+	if (!seg?.text || typeof seg.text !== "object") return false;
+	const raw = String(seg.text.link ?? "").trim();
+	if (raw === HIGHLIGHT_LINK) return true;
+	try {
+		const u = new URL(raw);
+		const path = u.pathname.replace(/\/+$/, "") || "/";
+		return u.hostname === "thymer.invalid" && path === "/highlight";
+	} catch (_) {
+		return false;
+	}
+}
+
+/**
+ * Plugin-created highlights always set sourceSegmentType. Plain Thymer linkobjs (auto-detected URLs, pasted
+ * `[text](url)`, etc.) reuse link+title only — same href in backups/plugin source can appear on hundreds of lines.
+ *
+ * Forwarded-email false positives: the old stitch could treat `"> "` + `"= "` as `==` — drop those via title
+ * shape only (`>`-leading lines, underline-only `===`). Intentional highlights in pasted source (||, long
+ * titles, etc.) must still count.
+ */
+function highlightTitleIsLikelyRealHighlight(title) {
+	if (title == null) return false;
+	const tsTrim = String(title).replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+	if (!tsTrim.length) return true;
+	if (/^\s*>/.test(tsTrim)) return false;
+	if (/^=+[ \t]*$/.test(tsTrim)) return false;
+	return true;
+}
+
+/** Plain text/bold/italic payload for segment-order scans (same idea as simpleNeighborType). */
+function segmentInlinePlainText(seg) {
+	if (!seg) return "";
+	if (seg.type !== "text" && seg.type !== "bold" && seg.type !== "italic") return "";
+	return typeof seg.text === "string" ? seg.text : "";
+}
+
+/**
+ * Email import often split `"> …=="` so the `>` sits in a prior text segment and the highlight title has no `>`.
+ * Treat as junk only when **all** text before the linkobj trims to quote-marker runes (e.g. `">"` or `">>> "`),
+ * not when real prose follows the marker (`"> Please see …"`).
+ */
+function highlightLinkobjHasEmailQuoteShimPrefix(segments, linkIndex) {
+	if (!segments?.length || linkIndex < 1) return false;
+	let prefix = "";
+	for (let i = 0; i < linkIndex; i++) prefix += segmentInlinePlainText(segments[i]);
+	return /^>+\s*$/.test(prefix.trim());
+}
+
+function lineItemRowType(item) {
+	try {
+		const t = item?.type ?? item?.getType?.();
+		return typeof t === "string" ? t.toLowerCase() : "";
+	} catch (_) {
+		return "";
+	}
+}
+
+function lineItemsByGuidMap(items) {
+	const m = new Map();
+	if (!items?.length) return m;
+	for (const it of items) {
+		try {
+			const g = it?.guid;
+			if (g) m.set(g, it);
+		} catch (_) {}
+	}
+	return m;
+}
+
+function lineItemParentGuid(item) {
+	try {
+		return item?.parent_guid ?? item?.parentGuid ?? item?.getParentGuid?.() ?? null;
+	} catch (_) {
+		return null;
+	}
+}
+
+/** Language on a syntax-colored block row (`meta_properties.language` in exports, or SDK helper). */
+function lineItemSyntaxLanguageFromRow(item) {
+	if (!item) return "";
+	try {
+		const meta = item.meta_properties ?? item.metaProperties;
+		if (meta && typeof meta === "object") {
+			const L = meta.language ?? meta.lang;
+			if (L != null && String(L).trim()) return String(L).trim();
+		}
+	} catch (_) {}
+	try {
+		const l = item.getHighlightLanguage?.();
+		if (l != null && String(l).trim()) return String(l).trim();
+	} catch (_) {}
+	return "";
+}
+
+/**
+ * Child rows of a `block` with a language often lack `getHighlightLanguage()`; walk `parent_guid` to find it.
+ */
+function lineItemIsUnderSyntaxBlock(item, itemsByGuid) {
+	if (!item || !itemsByGuid?.size) return false;
+	const seen = new Set();
+	let pg = lineItemParentGuid(item);
+	for (let n = 0; n < 48 && pg; n++) {
+		if (seen.has(pg)) break;
+		seen.add(pg);
+		const parent = itemsByGuid.get(pg);
+		if (!parent) break;
+		if (lineItemRowType(parent) === "block" && lineItemSyntaxLanguageFromRow(parent)) return true;
+		pg = lineItemParentGuid(parent);
+	}
+	return false;
+}
+
+function lineItemIsCodeBlockLine(item, itemsByGuid) {
+	if (!item) return false;
+	if (lineItemSyntaxLanguageFromRow(item)) return true;
+	if (itemsByGuid?.size && lineItemIsUnderSyntaxBlock(item, itemsByGuid)) return true;
+	return false;
+}
+
+/** Quote / email blockquote rows and syntax blocks should not contribute highlight-link counts or == parsing. */
+function lineItemIsNonProseHighlightHost(item, itemsByGuid) {
+	if (lineItemRowType(item) === "quote") return true;
+	return lineItemIsCodeBlockLine(item, itemsByGuid);
+}
+
 function isOurHighlightSegment(seg) {
-	return (
-		seg.type === "linkobj" &&
-		seg.text &&
-		typeof seg.text === "object" &&
-		String(seg.text.link || "").startsWith(HIGHLIGHT_LINK)
-	);
+	if (seg.type !== "linkobj" || !seg.text || typeof seg.text !== "object") return false;
+	if (!linkobjHrefIsOurHighlightUrl(seg)) return false;
+
+	const title = seg.text.title;
+	if (title == null) return false;
+	if (!highlightTitleIsLikelyRealHighlight(title)) return false;
+
+	const linkTrim = String(seg.text.link ?? "").trim();
+	const tsTrim = String(title).trim();
+
+	const st = seg.text.sourceSegmentType;
+	if (st === "text" || st === "bold" || st === "italic") {
+		if (tsTrim === linkTrim) return false;
+		return true;
+	}
+
+	if (!tsTrim.length) return false;
+	if (tsTrim === linkTrim) return false;
+	return true;
+}
+
+function lineItemHasOurHighlightLink(item, itemsByGuid) {
+	if (lineItemIsNonProseHighlightHost(item, itemsByGuid)) return false;
+	const segs = item?.segments;
+	if (!segs?.length) return false;
+	for (let i = 0; i < segs.length; i++) {
+		const seg = segs[i];
+		if (!isOurHighlightSegment(seg)) continue;
+		if (highlightLinkobjHasEmailQuoteShimPrefix(segs, i)) continue;
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Rescan one note (same rules as export dry-run) and update the browser-local highlight index.
+ */
+/** @returns {Promise<boolean>} whether the note currently has at least one qualifying highlight link */
+async function recomputeAndStoreRecordHighlightFlag(plugin, record) {
+	if (!plugin || !record) return false;
+	let rg = "";
+	try {
+		rg = String(record.getGuid?.() ?? record.guid ?? "").trim();
+	} catch (_) {}
+	if (!rg) return false;
+	let has = false;
+	try {
+		const items = await record.getLineItems(false);
+		const byG = lineItemsByGuidMap(items);
+		for (const item of items) {
+			if (lineItemHasOurHighlightLink(item, byG)) {
+				has = true;
+				break;
+			}
+		}
+	} catch (_) {}
+	setWorkspaceRecordHasHighlightLinks(plugin, rg, has);
+	return has;
 }
 
 function simpleNeighborType(seg) {
@@ -867,10 +1142,20 @@ async function maybeRewriteCrossLineChain(chain, skipGuids) {
 	for (const c of chain) {
 		if (c.text.includes(LINE_JOIN_CHAR)) return;
 	}
-	const combined = chain.map((c) => c.text).join(LINE_JOIN_CHAR);
-	if (!containsUnescapedEqEq(combined)) return;
+	let combined = "";
+	const map = [];
+	for (let si = 0; si < chain.length; si++) {
+		const t = chain[si].text;
+		for (let k = 0; k < t.length; k++) map.push({ si });
+		combined += t;
+		if (si < chain.length - 1) {
+			for (let k = 0; k < LINE_JOIN_CHAR.length; k++) map.push({ si: -1 });
+			combined += LINE_JOIN_CHAR;
+		}
+	}
+	if (!containsUnescapedEqEqInRun(combined, map)) return;
 
-	const ranges = splitByHighlightMarkerRanges(combined);
+	const ranges = splitByHighlightMarkerRanges(combined, map);
 	const hasHighlight = ranges.some((r) => r.kind === "highlight");
 	if (!hasHighlight) return;
 
@@ -885,10 +1170,15 @@ async function maybeRewriteCrossLineChain(chain, skipGuids) {
 	}
 }
 
-async function applyCrossLineHighlightChains(record, skipGuids) {
-	const items = await record.getLineItems(false);
+async function applyCrossLineHighlightChains(record, skipGuids, itemsPreloaded) {
+	const items = itemsPreloaded ?? (await record.getLineItems(false));
+	const byG = lineItemsByGuidMap(items);
 	let i = 0;
 	while (i < items.length) {
+		if (lineItemIsNonProseHighlightHost(items[i], byG)) {
+			i++;
+			continue;
+		}
 		const first = getSimpleTextCell(items[i]);
 		if (!first) {
 			i++;
@@ -902,6 +1192,7 @@ async function applyCrossLineHighlightChains(record, skipGuids) {
 		const chain = [{ item: items[i], type: first.type, text: first.text }];
 		while (j + 1 < items.length) {
 			if (skipGuids?.has(items[j + 1].guid)) break;
+			if (lineItemIsNonProseHighlightHost(items[j + 1], byG)) break;
 			const next = getSimpleTextCell(items[j + 1]);
 			if (!next || next.type !== first.type) break;
 			if (next.text.includes(LINE_JOIN_CHAR)) break;
@@ -2369,6 +2660,8 @@ class Plugin extends AppPlugin {
 	onLoad() {
 		this._skipHighlightOnce = new Set();
 		this._markerRestoreSkipClearTimeouts = [];
+		this._recordHighlightIndexTimers = new Map();
+		this._globalHighlightGuidsFn = null;
 		this._recentSelectionGuidsFromEvents = new Set();
 		this._lastTextSelectionLineGuids = new Set();
 		this._frozenTextSelection = null;
@@ -2384,59 +2677,95 @@ class Plugin extends AppPlugin {
 		this._handlerCreated = this.events.on("lineitem.created", onLine, opts);
 		this._handlerUpdated = this.events.on("lineitem.updated", onLine, opts);
 
-		this._cmdUnwrapPlainWhole = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Unwrap == convert to text (this note)",
-			icon: "eraser",
-			onSelected: () => {
-				void this._unwrapHighlightsInActiveNote("plain", "whole");
-			},
-		});
 		this._cmdUnwrapPlainSel = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Unwrap == convert to text (current selection)",
+			label: "Highlighter: Selection: plain text (strip == highlight links)",
 			icon: "eraser",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("plain", "selection");
 			},
 		});
+		this._cmdRestoreMarkersAllWorkspace = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: All notes: literal ==…== for Markdown export",
+			icon: "refresh",
+			onSelected: () => {
+				void this._restoreMarkersInAllWorkspaceRecords();
+			},
+		});
+		this._cmdRebuildHighlightRecordIndex = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: Rebuild local index of notes with highlight links",
+			icon: "list",
+			onSelected: () => {
+				void this._rebuildWorkspaceHighlightRecordIndex();
+			},
+		});
 		this._cmdUnwrapMarkersWhole = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Restore == convert to markers (this note)",
+			label: "Highlighter: This note: literal ==…== for Markdown export",
 			icon: "refresh",
 			onSelected: () => {
 				void this._unwrapHighlightsInActiveNote("markers", "whole");
 			},
 		});
-		this._cmdUnwrapMarkersSel = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Restore == convert to markers (current selection)",
-			icon: "refresh",
+		this._cmdUnwrapPlainWhole = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: This note: plain text (strip == highlight links)",
+			icon: "eraser",
 			onSelected: () => {
-				void this._unwrapHighlightsInActiveNote("markers", "selection");
+				void this._unwrapHighlightsInActiveNote("plain", "whole");
+			},
+		});
+		this._cmdDisableHighlightDetection = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: Disable ==…== → highlight auto-convert",
+			icon: "ban",
+			onSelected: () => {
+				if (!this._highlightDetectionEnabled) {
+					this.ui.addToaster({
+						title: "Highlighter",
+						message: "== highlight auto-detection is already off.",
+						dismissible: true,
+						autoDestroyTime: 4500,
+					});
+					return;
+				}
+				this._highlightDetectionEnabled = false;
+				persistHighlightDetectionEnabled(this, false);
+				this.ui.addToaster({
+					title: "Highlighter",
+					message:
+						"== highlight auto-detection is off. Existing highlights stay; new == won't convert until you turn it back on.",
+					dismissible: true,
+					autoDestroyTime: 6500,
+				});
 			},
 		});
 		this._cmdEnableHighlightDetection = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Enable == highlight auto-detection",
+			label: "Highlighter: Enable ==…== → highlight auto-convert",
 			icon: "highlight",
 			onSelected: () => {
-				if (this._highlightDetectionEnabled) return;
+				if (this._highlightDetectionEnabled) {
+					this.ui.addToaster({
+						title: "Highlighter",
+						message: "== highlight auto-detection is already on.",
+						dismissible: true,
+						autoDestroyTime: 4500,
+					});
+					return;
+				}
 				this._highlightDetectionEnabled = true;
 				persistHighlightDetectionEnabled(this, true);
 				const panel = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
 				void this._scanRecordLineItemsForHighlights(panel);
+				this.ui.addToaster({
+					title: "Highlighter",
+					message: "== highlight auto-detection is on. The open note was rescanned.",
+					dismissible: true,
+					autoDestroyTime: 5500,
+				});
 			},
 		});
-		this._cmdDisableHighlightDetection = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Disable == highlight auto-detection",
-			icon: "ban",
-			onSelected: () => {
-				if (!this._highlightDetectionEnabled) return;
-				this._highlightDetectionEnabled = false;
-				persistHighlightDetectionEnabled(this, false);
-			},
-		});
-		this._cmdRestoreMarkersAllWorkspace = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Restore all == convert all notes to markers",
+		this._cmdUnwrapMarkersSel = this.ui.addCommandPaletteCommand({
+			label: "Highlighter: Selection: literal ==…== for Markdown export",
 			icon: "refresh",
 			onSelected: () => {
-				void this._restoreMarkersInAllWorkspaceRecords();
+				void this._unwrapHighlightsInActiveNote("markers", "selection");
 			},
 		});
 
@@ -2542,6 +2871,11 @@ class Plugin extends AppPlugin {
 			const panel = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
 			ensureEditorDocumentSelectionListeners(this, panel);
 		}, 0);
+
+		this._globalHighlightGuidsFn = () => getWorkspaceHighlightRecordGuids(this);
+		if (typeof globalThis !== "undefined") {
+			globalThis.thymerHighlighterGetHighlightRecordGuids = this._globalHighlightGuidsFn;
+		}
 	}
 
 	onUnload() {
@@ -2550,13 +2884,14 @@ class Plugin extends AppPlugin {
 		if (this._handlerPanelNavigated) this.events.off(this._handlerPanelNavigated);
 		if (this._handlerPanelFocused) this.events.off(this._handlerPanelFocused);
 		if (this._handlerReload) this.events.off(this._handlerReload);
-		this._cmdUnwrapPlainWhole?.remove();
 		this._cmdUnwrapPlainSel?.remove();
-		this._cmdUnwrapMarkersWhole?.remove();
-		this._cmdUnwrapMarkersSel?.remove();
-		this._cmdEnableHighlightDetection?.remove();
-		this._cmdDisableHighlightDetection?.remove();
 		this._cmdRestoreMarkersAllWorkspace?.remove();
+		this._cmdRebuildHighlightRecordIndex?.remove();
+		this._cmdUnwrapMarkersWhole?.remove();
+		this._cmdUnwrapPlainWhole?.remove();
+		this._cmdDisableHighlightDetection?.remove();
+		this._cmdEnableHighlightDetection?.remove();
+		this._cmdUnwrapMarkersSel?.remove();
 		for (const tid of this._markerRestoreSkipClearTimeouts || []) clearTimeout(tid);
 		this._markerRestoreSkipClearTimeouts = [];
 		clearTimeout(this._selectionGuidsFromEventClearT);
@@ -2570,6 +2905,67 @@ class Plugin extends AppPlugin {
 		}
 		detachIframeSelectionListener(this);
 		if (this._selSnapRaf) cancelAnimationFrame(this._selSnapRaf);
+		for (const tid of this._recordHighlightIndexTimers?.values() ?? []) clearTimeout(tid);
+		this._recordHighlightIndexTimers?.clear();
+		if (typeof globalThis !== "undefined" && this._globalHighlightGuidsFn) {
+			if (globalThis.thymerHighlighterGetHighlightRecordGuids === this._globalHighlightGuidsFn) {
+				delete globalThis.thymerHighlighterGetHighlightRecordGuids;
+			}
+		}
+		this._globalHighlightGuidsFn = null;
+	}
+
+	_scheduleRecordHighlightIndexUpdate(record) {
+		if (!record) return;
+		let rg = "";
+		try {
+			rg = String(record.getGuid?.() ?? record.guid ?? "").trim();
+		} catch (_) {}
+		if (!rg) return;
+		const prev = this._recordHighlightIndexTimers.get(rg);
+		if (prev) clearTimeout(prev);
+		const tid = setTimeout(() => {
+			this._recordHighlightIndexTimers.delete(rg);
+			void recomputeAndStoreRecordHighlightFlag(this, record);
+		}, RECORD_HIGHLIGHT_INDEX_DEBOUNCE_MS);
+		this._recordHighlightIndexTimers.set(rg, tid);
+	}
+
+	/** Rescan every workspace note and refresh {@link LS_KEY_RECORDS_WITH_HIGHLIGHTS} for this browser. */
+	async _rebuildWorkspaceHighlightRecordIndex() {
+		let records;
+		try {
+			records = this.data.getAllRecords?.();
+		} catch (_) {
+			this.ui.addToaster({
+				title: "Highlighter",
+				message: "Could not read workspace notes.",
+				dismissible: true,
+				autoDestroyTime: 5000,
+			});
+			return;
+		}
+		if (!records?.length) {
+			this.ui.addToaster({
+				title: "Highlighter",
+				message: "No notes found in this workspace.",
+				dismissible: true,
+				autoDestroyTime: 5000,
+			});
+			return;
+		}
+		let withHits = 0;
+		for (const record of records) {
+			try {
+				if (await recomputeAndStoreRecordHighlightFlag(this, record)) withHits++;
+			} catch (_) {}
+		}
+		this.ui.addToaster({
+			title: "Highlighter — index rebuilt",
+			message: `${records.length} note(s) scanned. ${withHits} note(s) listed as containing highlight links (browser-local; see README).`,
+			dismissible: true,
+			autoDestroyTime: 9000,
+		});
 	}
 
 	_scheduleSelectionSnapshot() {
@@ -2640,16 +3036,90 @@ class Plugin extends AppPlugin {
 			});
 			return;
 		}
+
+		const dryRun = readWorkspaceMarkdownExportDryRun();
+		const n = records.length;
+		this.ui.addToaster({
+			title: "Highlighter",
+			message: dryRun
+				? `Dry-run started: ${n} note(s). No writes — counting lines with == highlight links only. Open the browser console for per-note detail.`
+				: `Started: scanning ${n} note(s) for highlight links…`,
+			dismissible: true,
+			autoDestroyTime: dryRun ? 8000 : 5000,
+		});
+
+		if (dryRun) {
+			let notesWithHits = 0;
+			let linesWithHighlights = 0;
+			/** @type {{ noteName: string, noteGuid: string, lineGuids: string[], lineCount: number }[]} */
+			const report = [];
+			for (const record of records) {
+				let noteGuid = "";
+				try {
+					noteGuid = String(record.getGuid?.() ?? record.guid ?? "").trim();
+				} catch (_) {}
+				try {
+					const items = await record.getLineItems(false);
+					const byG = lineItemsByGuidMap(items);
+					const hitGuids = [];
+					for (const item of items) {
+						if (lineItemHasOurHighlightLink(item, byG)) {
+							hitGuids.push(item.guid);
+							linesWithHighlights++;
+						}
+					}
+					if (noteGuid) setWorkspaceRecordHasHighlightLinks(this, noteGuid, hitGuids.length > 0);
+					if (hitGuids.length) {
+						notesWithHits++;
+						let noteName = "";
+						try {
+							noteName = record.getName?.() ?? "";
+						} catch (_) {}
+						report.push({
+							noteName: noteName || "(untitled)",
+							noteGuid,
+							lineGuids: hitGuids,
+							lineCount: hitGuids.length,
+						});
+					}
+				} catch (_) {}
+			}
+			if (typeof console !== "undefined" && console.log) {
+				console.log("[Highlighter] workspace Markdown export dry-run", {
+					notesScanned: n,
+					notesWithHighlightLines: notesWithHits,
+					lineItemsWithHighlightLinks: linesWithHighlights,
+					perNote: report,
+				});
+			}
+			const sample =
+				report.length <= 3
+					? report.map((r) => `${r.noteName}: ${r.lineCount} line(s)`).join(" · ")
+					: `${report.length} notes (see console for names & line GUIDs)`;
+			this.ui.addToaster({
+				title: "Highlighter — dry-run done",
+				message: `${n} note(s) scanned. ${notesWithHits} note(s) with ${linesWithHighlights} line item(s) containing highlight links. ${sample}`,
+				dismissible: true,
+				autoDestroyTime: 12000,
+			});
+			return;
+		}
+
 		const allMarkerGuids = [];
 		let recordsConverted = 0;
 		for (const record of records) {
 			try {
 				let items = await record.getLineItems(false);
-				await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
+				await applyCrossLineHighlightChains(record, this._skipHighlightOnce, items);
 				items = await record.getLineItems(false);
-				const { markerGuids } = await this._unwrapTargetsToMode(items, "markers");
+				const byG = lineItemsByGuidMap(items);
+				const { markerGuids } = await this._unwrapTargetsToMode(
+					items.filter((it) => !lineItemIsNonProseHighlightHost(it, byG)),
+					"markers",
+				);
 				if (markerGuids.length) recordsConverted++;
 				for (const g of markerGuids) allMarkerGuids.push(g);
+				void recomputeAndStoreRecordHighlightFlag(this, record);
 			} catch (_) {}
 		}
 		this._scheduleMarkerSkipClear(allMarkerGuids);
@@ -2669,7 +3139,6 @@ class Plugin extends AppPlugin {
 			autoDestroyTime: 7500,
 		});
 	}
-
 	/**
 	 * @param {"plain" | "markers"} mode
 	 * @param {"whole" | "selection"} scope whole = every line; selection = only detected selected line items
@@ -2688,24 +3157,29 @@ class Plugin extends AppPlugin {
 			await snapshotEditorSelectionInto(this, panel);
 		}
 		let items = await record.getLineItems(false);
-		await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
+		await applyCrossLineHighlightChains(record, this._skipHighlightOnce, items);
 		items = await record.getLineItems(false);
+		const byG = lineItemsByGuidMap(items);
 		const selectedSet = getSelectedLineItemGuidSet(panel, items, this, record);
 
 		if (scope === "selection" && (!selectedSet || !selectedSet.size)) {
 			return;
 		}
 
-		const targets =
-			scope === "whole" ? items : items.filter((it) => selectedSet.has(it.guid));
+		const targets = (scope === "whole" ? items : items.filter((it) => selectedSet.has(it.guid))).filter(
+			(it) => !lineItemIsNonProseHighlightHost(it, byG),
+		);
 
 		const { markerGuids } = await this._unwrapTargetsToMode(targets, mode);
 		if (mode === "markers" && markerGuids.length) this._scheduleMarkerSkipClear(markerGuids);
+		this._scheduleRecordHighlightIndexUpdate(record);
 	}
 
-	async _processLineItemHighlight(lineItem, segmentsPreferred) {
+	async _processLineItemHighlight(lineItem, segmentsPreferred, itemsByGuid) {
 		if (!lineItem || !this._highlightDetectionEnabled) return;
 		if (this._skipHighlightOnce.has(lineItem.guid)) return;
+		const byG = itemsByGuid ?? new Map();
+		if (lineItemIsNonProseHighlightHost(lineItem, byG)) return;
 		let segments = segmentsPreferred ?? lineItem.segments;
 		if (!segments || !segments.length) return;
 
@@ -2732,17 +3206,28 @@ class Plugin extends AppPlugin {
 		}
 
 		const record = ev.getRecord();
-		if (this._highlightDetectionEnabled && record) await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
+		let itemsPre = null;
+		let itemsByGuid = null;
+		if (record) {
+			itemsPre = await record.getLineItems(false);
+			itemsByGuid = lineItemsByGuidMap(itemsPre);
+		}
+		if (this._highlightDetectionEnabled && record)
+			await applyCrossLineHighlightChains(record, this._skipHighlightOnce, itemsPre ?? undefined);
 
 		const lineItem = await ev.getLineItem();
-		if (!lineItem) return;
+		if (!lineItem) {
+			if (record) this._scheduleRecordHighlightIndexUpdate(record);
+			return;
+		}
 
 		let segmentsPreferred = null;
 		if (!record && ev.eventName === "lineitem.updated" && ev.hasSegments()) {
 			const fromEvent = ev.getSegments();
 			if (fromEvent) segmentsPreferred = fromEvent;
 		}
-		await this._processLineItemHighlight(lineItem, segmentsPreferred);
+		await this._processLineItemHighlight(lineItem, segmentsPreferred, itemsByGuid ?? new Map());
+		if (record) this._scheduleRecordHighlightIndexUpdate(record);
 	}
 
 	async _scanRecordLineItemsForHighlights(panel) {
@@ -2750,10 +3235,13 @@ class Plugin extends AppPlugin {
 		if (!panel || panel.getType() !== PANEL_TYPE_EDITOR) return;
 		const record = panel.getActiveRecord();
 		if (!record) return;
-		await applyCrossLineHighlightChains(record, this._skipHighlightOnce);
 		const items = await record.getLineItems(false);
-		for (const item of items) {
-			await this._processLineItemHighlight(item, null);
+		await applyCrossLineHighlightChains(record, this._skipHighlightOnce, items);
+		const itemsAfter = await record.getLineItems(false);
+		const byG = lineItemsByGuidMap(itemsAfter);
+		for (const item of itemsAfter) {
+			await this._processLineItemHighlight(item, null, byG);
 		}
+		this._scheduleRecordHighlightIndexUpdate(record);
 	}
 }
