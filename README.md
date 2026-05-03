@@ -2,11 +2,11 @@
 
 Thymer plugin that treats `==highlighted text==` like Obsidian-style markers: it turns those segments into soft yellow highlights in the editor. Thymer does not ship a native highlight segment type, so the plugin stores highlights as styled link segments and injects matching CSS.
 
-**Version:** `1.0.3` (in `plugin.json` as `version`). The `ver` field is the manifest / API version expected by Thymer. The same number appears as `PLUGIN_VERSION` at the top of `plugin.js` — keep them aligned when releasing.
+**Version:** `1.0.4` (in `plugin.json` as `version`). The `ver` field is the manifest / API version expected by Thymer. The same number appears as `PLUGIN_VERSION` at the top of `plugin.js` — keep them aligned when releasing.
 
 ## Features
 
-- **Live conversion** — While you type or paste, `==…==` pairs on normal text/bold/italic runs become highlight links (when auto-detection is on).
+- **Live conversion** — While you type or paste, `==…==` pairs on normal text/bold/italic runs become highlight links (when auto-detection is on). Adjacent **bold** or **italic** cells may split the two `=` characters across a segment boundary; those pairs still convert. **`sourceSegmentType`** (text / bold / italic) is stored on the link and reflected in the editor via href fragments `…/highlight#st=bold` or `#st=italic` plus CSS, so weight and slant match even when Thymer does not wrap the link in `<strong>` / `<em>`.
 - **Multi-line highlights** — Highlights can span consecutive compatible lines; the plugin chains marker ranges across rows when possible.
 - **Escaping** — Use `\` so `\\==` and `\\=` emit literal `==` and `=`, and `\\==` can block a pair from being treated as a delimiter. Only **`==…==`** (two equals each side) starts a span; a lone `=` next to text in another segment does not form a pair. **Code block** lines (syntax-highlighted / `getHighlightLanguage` in Thymer) are never auto-converted; inline code segments are skipped too.
 - **Scan on load** — Opening a note, focusing the editor, or reloading the plugin can rescan the open page for `==…==` (when auto-detection is on).
@@ -53,6 +53,7 @@ Selection-scoped commands infer rows using the selection, cached geometry, point
 
 ## Changelog
 
+- **1.0.4** — Bold/italic highlight display (`#st=` href fragments + CSS); `==` detection across adjacent bold/italic cells; `sourceSegmentType` sync runs even when auto-convert is off; neighbor sync skips whitespace-only segments. Version bump and README updates.
 - **1.0.3** — Version aligned across `plugin.json`, `PLUGIN_VERSION`, and README; README clarifies localStorage / site-data behavior for the highlight index.
 
 ## Installation

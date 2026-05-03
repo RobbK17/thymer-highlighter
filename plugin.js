@@ -6,7 +6,8 @@
  * \\ escapes backslash; \\== and \\= emit literal == and =; \\== prevents a pair from being a delimiter.
  * Multi-line ==…== is supported across consecutive single-segment lines of the same type (text/bold/italic).
  * Within one line, consecutive text/bold/italic segments are parsed together so == survives Thymer splitting **…**.
- * A pair must be real == inside one segment (not one = at the end of a segment and the next at the start of the next).
+ * For **plain text**, both "=" of an opener/closer must sit in the same segment (avoids `foo=` + `=bar` false pairs).
+ * For **bold** or **italic**, adjacent cells may split "==" across the boundary (`=` | `=…`) and still pair.
  * Syntax blocks skip conversion: rows with `getHighlightLanguage`, children of a `block` row with `meta_properties.language`, and Thymer `quote` (email blockquote) rows; inline `code` segments were already skipped.
  *
  * “Selected lines” matches Thymer’s text workflow: we keep the line GUIDs for the current editor
@@ -17,7 +18,7 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.3";
+const PLUGIN_VERSION = "1.0.4";
 
 const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
 
@@ -117,6 +118,14 @@ function getWorkspaceHighlightRecordGuids(plugin) {
 
 const HIGHLIGHT_LINK = "https://thymer.invalid/highlight";
 
+/** Href for stored highlights; fragment encodes sourceSegmentType for CSS (DOM often omits strong/em around linkobjs). */
+function highlightHrefForSourceType(sourceSegmentType) {
+	const st =
+		sourceSegmentType === "bold" || sourceSegmentType === "italic" ? sourceSegmentType : "text";
+	if (st === "text") return HIGHLIGHT_LINK;
+	return `${HIGHLIGHT_LINK}#st=${st}`;
+}
+
 const SKIP_SEGMENT_TYPES = new Set([
 	"code",
 	"icon",
@@ -158,17 +167,26 @@ function findNextUnescapedEqEq(str, from) {
 }
 
 /**
- * Like findNextUnescapedEqEq, but only when both "=" come from the same Thymer segment (`map` index).
- * Prevents `foo=` + `=bar` from forming a false `==` pair across a segment boundary (real pairs are `==…==` in one cell or wholly inside one segment).
- * @param {{ si: number }[]} map from buildRunCombined
+ * Like findNextUnescapedEqEq, but only when both "=" are allowed as a pair:
+ * - Both come from the same Thymer segment (`map`), or
+ * - They straddle the join between adjacent segments with the **same** type and
+ *   that type is **bold** or **italic** (Thymer often splits "==" across two bold/italic cells).
+ *   Plain **text** stays same-segment only so `foo=` + `=bar` does not become a false pair.
+ * @param {{ si: number }[]} map from buildRunCombined (or cross-line chain map)
+ * @param {{ type?: string }[] | null} run parallel to map segment indices; required for cross-segment pairs
  */
-function findNextUnescapedEqEqInRun(str, from, map) {
+function findNextUnescapedEqEqInRun(str, from, map, run) {
 	for (let p = from; p <= str.length - 2; p++) {
 		if (str[p] !== "=" || str[p + 1] !== "=" || isEqEqEscaped(str, p)) continue;
 		const a = map[p];
 		const b = map[p + 1];
-		if (!a || !b || a.si !== b.si || a.si < 0) continue;
-		return p;
+		if (!a || !b || a.si < 0 || b.si < 0) continue;
+		if (a.si === b.si) return p;
+		if (!run?.length || b.si !== a.si + 1) continue;
+		const ta = run[a.si]?.type;
+		const tb = run[b.si]?.type;
+		if (ta !== tb) continue;
+		if (ta === "bold" || ta === "italic") return p;
 	}
 	return -1;
 }
@@ -177,8 +195,8 @@ function containsUnescapedEqEq(str) {
 	return findNextUnescapedEqEq(str, 0) !== -1;
 }
 
-function containsUnescapedEqEqInRun(str, map) {
-	return findNextUnescapedEqEqInRun(str, 0, map) !== -1;
+function containsUnescapedEqEqInRun(str, map, run) {
+	return findNextUnescapedEqEqInRun(str, 0, map, run) !== -1;
 }
 
 /** Turn user escapes into literal characters (after == delimiters are stripped). */
@@ -204,12 +222,12 @@ function unescapeText(str) {
 	return out;
 }
 
-function splitByHighlightMarkerRanges(str, map) {
+function splitByHighlightMarkerRanges(str, map, run) {
 	const ranges = [];
 	let i = 0;
 	while (i < str.length) {
 		const open = map
-			? findNextUnescapedEqEqInRun(str, i, map)
+			? findNextUnescapedEqEqInRun(str, i, map, run)
 			: findNextUnescapedEqEq(str, i);
 		if (open === -1) {
 			if (i < str.length) ranges.push({ kind: "text", start: i, end: str.length });
@@ -217,7 +235,7 @@ function splitByHighlightMarkerRanges(str, map) {
 		}
 		if (open > i) ranges.push({ kind: "text", start: i, end: open });
 		const close = map
-			? findNextUnescapedEqEqInRun(str, open + 2, map)
+			? findNextUnescapedEqEqInRun(str, open + 2, map, run)
 			: findNextUnescapedEqEq(str, open + 2);
 		if (close === -1) {
 			ranges.push({ kind: "text", start: open, end: str.length });
@@ -245,7 +263,7 @@ function partsToSegments(baseType, parts) {
 			out.push({
 				type: "linkobj",
 				text: {
-					link: HIGHLIGHT_LINK,
+					link: highlightHrefForSourceType(baseType),
 					title: p.value,
 					sourceSegmentType: baseType,
 				},
@@ -315,10 +333,10 @@ function emitTextSubrangesFromRun(run, combined, map, rs, re, out) {
 function expandSplittableRun(run) {
 	if (run.length === 1) return expandSegment(run[0]);
 	const { combined, map } = buildRunCombined(run);
-	if (!containsUnescapedEqEqInRun(combined, map)) {
+	if (!containsUnescapedEqEqInRun(combined, map, run)) {
 		return run.map((s) => ({ type: s.type, text: s.text }));
 	}
-	const ranges = splitByHighlightMarkerRanges(combined, map);
+	const ranges = splitByHighlightMarkerRanges(combined, map, run);
 	const out = [];
 	for (const r of ranges) {
 		if (r.start >= r.end) continue;
@@ -333,7 +351,7 @@ function expandSplittableRun(run) {
 			out.push({
 				type: "linkobj",
 				text: {
-					link: HIGHLIGHT_LINK,
+					link: highlightHrefForSourceType(st),
 					title: unescapeText(combined.slice(r.start, r.end)),
 					sourceSegmentType: st,
 				},
@@ -360,7 +378,7 @@ function mightContainHighlightSyntax(segments) {
 			j++;
 		}
 		const { combined, map } = buildRunCombined(run);
-		if (containsUnescapedEqEqInRun(combined, map)) return true;
+		if (containsUnescapedEqEqInRun(combined, map, run)) return true;
 		i = j;
 	}
 	return false;
@@ -619,6 +637,26 @@ function simpleNeighborType(seg) {
 }
 
 /**
+ * Walk left/right from a highlight to the nearest “meaningful” text/bold/italic neighbor, skipping
+ * whitespace-only text/italic/bold crumbs and adjacent highlight segments. Stops at code/link/etc.
+ * @param {number} delta -1 = walk toward start, +1 = toward end
+ * @returns {"text"|"bold"|"italic"|null}
+ */
+function inlineStyleNeighborBeyondWhitespace(segments, highlightIndex, delta) {
+	if (!segments?.length) return null;
+	for (let j = highlightIndex + delta; j >= 0 && j < segments.length; j += delta) {
+		const seg = segments[j];
+		if (isOurHighlightSegment(seg)) continue;
+		const t = simpleNeighborType(seg);
+		if (!t) return null;
+		const plain = segmentInlinePlainText(seg);
+		if (!plain.replace(/[\s\u00a0\u200B-\u200D\uFEFF]/g, "").length) continue;
+		return t;
+	}
+	return null;
+}
+
+/**
  * After Thymer toggles bold/italic on a range, highlight linkobjs stay separate segments with a stale
  * sourceSegmentType. Align that field with neighboring text/bold/italic segments.
  * @returns {{ segments: object[], changed: boolean }}
@@ -633,21 +671,23 @@ function syncHighlightSourceTypesWithNeighbors(segments) {
 			next.push(s);
 			continue;
 		}
-		const lt = simpleNeighborType(next[next.length - 1]);
-		const rt = simpleNeighborType(segments[i + 1]);
+		const lt = inlineStyleNeighborBeyondWhitespace(segments, i, -1);
+		const rt = inlineStyleNeighborBeyondWhitespace(segments, i, 1);
 		let inferred = "text";
 		if (lt && rt && lt === rt) inferred = lt;
 		else if (lt && rt && lt !== rt) {
 			if (lt === "bold" || rt === "bold") inferred = "bold";
 			else if (lt === "italic" || rt === "italic") inferred = "italic";
 			else inferred = lt;
-		} else if (lt) inferred = lt;
+		} 		else if (lt) inferred = lt;
 		else if (rt) inferred = rt;
+		const canonical = highlightHrefForSourceType(inferred);
 		const prevSt = s.text.sourceSegmentType ?? "text";
-		if (prevSt !== inferred) {
+		const prevLink = String(s.text.link ?? "").trim();
+		if (prevSt !== inferred || prevLink !== canonical) {
 			next.push({
 				type: "linkobj",
-				text: { ...s.text, sourceSegmentType: inferred },
+				text: { ...s.text, sourceSegmentType: inferred, link: canonical },
 			});
 			changed = true;
 		} else {
@@ -1153,9 +1193,9 @@ async function maybeRewriteCrossLineChain(chain, skipGuids) {
 			combined += LINE_JOIN_CHAR;
 		}
 	}
-	if (!containsUnescapedEqEqInRun(combined, map)) return;
+	if (!containsUnescapedEqEqInRun(combined, map, chain)) return;
 
-	const ranges = splitByHighlightMarkerRanges(combined, map);
+	const ranges = splitByHighlightMarkerRanges(combined, map, chain);
 	const hasHighlight = ranges.some((r) => r.kind === "highlight");
 	if (!hasHighlight) return;
 
@@ -1211,8 +1251,7 @@ a[href^="${HIGHLIGHT_LINK}"] {
 	/* Longhands (not font: shorthand) so H1/H2 size wins over global link styles in Thymer */
 	font-family: inherit !important;
 	font-size: inherit !important;
-	/* bolder steps from computed parent so bold rows still read bold inside linkobj overrides */
-	font-weight: bolder !important;
+	font-weight: inherit !important;
 	font-style: inherit !important;
 	font-stretch: inherit !important;
 	font-variant: inherit !important;
@@ -1232,6 +1271,13 @@ a[href^="${HIGHLIGHT_LINK}"] {
 	-webkit-box-decoration-break: clone;
 	cursor: inherit;
 	pointer-events: none;
+}
+/* When Thymer does not wrap linkobjs in strong/em, href carries #st=bold | #st=italic (see highlightHrefForSourceType). */
+a[href^="${HIGHLIGHT_LINK}#st=bold"] {
+	font-weight: 700 !important;
+}
+a[href^="${HIGHLIGHT_LINK}#st=italic"] {
+	font-style: italic !important;
 }
 /* Highlight <a> often keeps default weight inside bold UI — match common Thymer / rich-text wrappers */
 .line-div strong a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
@@ -1319,6 +1365,20 @@ h6 a[href^="${HIGHLIGHT_LINK}"] {
 	line-height: 1.32 !important;
 	letter-spacing: inherit !important;
 	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+}
+.line-div.heading-h1 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h1 a[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h2 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h2 a[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h3 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h3 a[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h4 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h4 a[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h5 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h5 a[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h6 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
+.line-div.heading-h6 a[href^="${HIGHLIGHT_LINK}#st=italic"] {
+	font-style: italic !important;
 }
 @media (prefers-color-scheme: dark) {
 	a[href^="${HIGHLIGHT_LINK}"] {
@@ -3176,7 +3236,7 @@ class Plugin extends AppPlugin {
 	}
 
 	async _processLineItemHighlight(lineItem, segmentsPreferred, itemsByGuid) {
-		if (!lineItem || !this._highlightDetectionEnabled) return;
+		if (!lineItem) return;
 		if (this._skipHighlightOnce.has(lineItem.guid)) return;
 		const byG = itemsByGuid ?? new Map();
 		if (lineItemIsNonProseHighlightHost(lineItem, byG)) return;
@@ -3189,6 +3249,7 @@ class Plugin extends AppPlugin {
 			segments = synced.segments;
 		}
 
+		if (!this._highlightDetectionEnabled) return;
 		if (!mightContainHighlightSyntax(segments)) return;
 		const next = transformSegments(segments);
 		if (!segmentsDiffer(segments, next)) return;
