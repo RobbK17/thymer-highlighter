@@ -18,7 +18,7 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.4";
+const PLUGIN_VERSION = "1.0.5";
 
 const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
 
@@ -51,20 +51,18 @@ function persistHighlightDetectionEnabled(plugin, enabled) {
 }
 
 /**
- * When true, “All notes: literal ==…” only scans and toasts/logs results — no setSegments, no cross-line rewrites.
- * Toggle in devtools: localStorage.setItem("thymerHighlighter:workspaceMarkdownExportDryRun", "1")
- * Clear: removeItem or set "0".
+ * @param {object} ui plugin UI with addToaster
+ * @param {string} message
+ * @param {{ title?: string, autoDestroyTime?: number, dismissible?: boolean }} [options] default title "Highlighter", dismissible true, autoDestroyTime 5000
  */
-const LS_KEY_WORKSPACE_MARKDOWN_EXPORT_DRY_RUN = "thymerHighlighter:workspaceMarkdownExportDryRun";
-
-function readWorkspaceMarkdownExportDryRun() {
-	try {
-		if (typeof localStorage === "undefined") return false;
-		const v = localStorage.getItem(LS_KEY_WORKSPACE_MARKDOWN_EXPORT_DRY_RUN);
-		return v === "1" || v === "true";
-	} catch (_) {
-		return false;
-	}
+function highlighterToaster(ui, message, options = {}) {
+	if (!ui?.addToaster) return;
+	ui.addToaster({
+		title: options.title ?? "Highlighter",
+		message,
+		dismissible: options.dismissible !== false,
+		autoDestroyTime: options.autoDestroyTime ?? 5000,
+	});
 }
 
 /**
@@ -104,16 +102,6 @@ function setWorkspaceRecordHasHighlightLinks(plugin, recordGuid, has) {
 	else delete all[ws][rg];
 	if (!has && all[ws] && !Object.keys(all[ws]).length) delete all[ws];
 	persistRecordsWithHighlightsMap(all);
-}
-
-/** @returns {string[]} record GUIDs marked in {@link LS_KEY_RECORDS_WITH_HIGHLIGHTS} for the current workspace */
-function getWorkspaceHighlightRecordGuids(plugin) {
-	const ws = String(plugin?.getWorkspaceGuid?.() ?? "").trim();
-	if (!ws) return [];
-	const all = loadRecordsWithHighlightsMap();
-	const m = all[ws];
-	if (!m || typeof m !== "object") return [];
-	return Object.keys(m);
 }
 
 const HIGHLIGHT_LINK = "https://thymer.invalid/highlight";
@@ -605,7 +593,7 @@ function lineItemHasOurHighlightLink(item, itemsByGuid) {
 }
 
 /**
- * Rescan one note (same rules as export dry-run) and update the browser-local highlight index.
+ * Rescan one note (same highlight-link rules as workspace export counting) and update the browser-local highlight index.
  */
 /** @returns {Promise<boolean>} whether the note currently has at least one qualifying highlight link */
 async function recomputeAndStoreRecordHighlightFlag(plugin, record) {
@@ -1244,9 +1232,57 @@ async function applyCrossLineHighlightChains(record, skipGuids, itemsPreloaded) 
 	}
 }
 
+const HIGHLIGHT_HEADING_UI_FONT =
+	'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
+
+/** Typography per `.line-div.heading-h{n}` for highlight links (matches former per-level rules). */
+const HIGHLIGHT_HEADING_LEVELS = [
+	{ level: 1, fontSize: "2rem", fontWeight: 700, lineHeight: 1.2 },
+	{ level: 2, fontSize: "1.65rem", fontWeight: 650, lineHeight: 1.22 },
+	{ level: 3, fontSize: "1.35rem", fontWeight: 600, lineHeight: 1.25 },
+	{ level: 4, fontSize: "1.2rem", fontWeight: 600, lineHeight: 1.28 },
+	{ level: 5, fontSize: "1.05rem", fontWeight: 600, lineHeight: 1.3 },
+	{ level: 6, fontSize: "0.95rem", fontWeight: 600, lineHeight: 1.32 },
+];
+
+/**
+ * CSS for highlight anchors inside heading rows: explicit sizes on `.line-div.heading-h*` and italic override.
+ * @param {string} linkBase same as HIGHLIGHT_LINK
+ */
+function buildHeadingHighlightRules(linkBase) {
+	let out = "";
+	const italicSelectors = [];
+	for (const { level, fontSize, fontWeight, lineHeight } of HIGHLIGHT_HEADING_LEVELS) {
+		const cls = `.line-div.heading-h${level}`;
+		out += `
+${cls} a.lineitem-linkobj[href^="${linkBase}"],
+${cls} a[href^="${linkBase}"] {
+	font-size: ${fontSize} !important;
+	font-weight: ${fontWeight} !important;
+	font-style: normal !important;
+	line-height: ${lineHeight} !important;
+	letter-spacing: inherit !important;
+	font-family: ${HIGHLIGHT_HEADING_UI_FONT} !important;
+}`;
+		italicSelectors.push(
+			`${cls} a.lineitem-linkobj[href^="${linkBase}#st=italic"]`,
+			`${cls} a[href^="${linkBase}#st=italic"]`,
+		);
+	}
+	out += `
+${italicSelectors.join(",\n")} {
+	font-style: italic !important;
+}`;
+	return out;
+}
+
 function injectHighlightStyles(ui) {
+	const L = HIGHLIGHT_LINK;
+	const headingSemanticInherit = HIGHLIGHT_HEADING_LEVELS.map(({ level }) => `h${level} a[href^="${L}"]`).join(
+		",\n",
+	);
 	ui.injectCSS(`
-a[href^="${HIGHLIGHT_LINK}"] {
+a[href^="${L}"] {
 	/* Obsidian-style ==mark==: pale creamy gold + deep golden-brown label text */
 	/* Longhands (not font: shorthand) so H1/H2 size wins over global link styles in Thymer */
 	font-family: inherit !important;
@@ -1273,36 +1309,31 @@ a[href^="${HIGHLIGHT_LINK}"] {
 	pointer-events: none;
 }
 /* When Thymer does not wrap linkobjs in strong/em, href carries #st=bold | #st=italic (see highlightHrefForSourceType). */
-a[href^="${HIGHLIGHT_LINK}#st=bold"] {
+a[href^="${L}#st=bold"] {
 	font-weight: 700 !important;
 }
-a[href^="${HIGHLIGHT_LINK}#st=italic"] {
+a[href^="${L}#st=italic"] {
 	font-style: italic !important;
 }
 /* Highlight <a> often keeps default weight inside bold UI — match common Thymer / rich-text wrappers */
-.line-div strong a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div strong a[href^="${HIGHLIGHT_LINK}"],
-.line-div b a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div b a[href^="${HIGHLIGHT_LINK}"],
-.lineitem-text.bold a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.lineitem-text.bold a[href^="${HIGHLIGHT_LINK}"],
-.line-div [class*="lineitem-bold"] a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div [class*="segment-bold"] a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.font-bold a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-[data-font-weight="bold"] a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"] {
+.line-div strong a.lineitem-linkobj[href^="${L}"],
+.line-div strong a[href^="${L}"],
+.line-div b a.lineitem-linkobj[href^="${L}"],
+.line-div b a[href^="${L}"],
+.lineitem-text.bold a.lineitem-linkobj[href^="${L}"],
+.lineitem-text.bold a[href^="${L}"],
+.line-div [class*="lineitem-bold"] a.lineitem-linkobj[href^="${L}"],
+.line-div [class*="segment-bold"] a.lineitem-linkobj[href^="${L}"],
+.font-bold a.lineitem-linkobj[href^="${L}"],
+[data-font-weight="bold"] a.lineitem-linkobj[href^="${L}"] {
 	font-weight: 700 !important;
 }
-.line-div em a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div em a[href^="${HIGHLIGHT_LINK}"],
-.line-div i a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"] {
+.line-div em a.lineitem-linkobj[href^="${L}"],
+.line-div em a[href^="${L}"],
+.line-div i a.lineitem-linkobj[href^="${L}"] {
 	font-style: italic !important;
 }
-h1 a[href^="${HIGHLIGHT_LINK}"],
-h2 a[href^="${HIGHLIGHT_LINK}"],
-h3 a[href^="${HIGHLIGHT_LINK}"],
-h4 a[href^="${HIGHLIGHT_LINK}"],
-h5 a[href^="${HIGHLIGHT_LINK}"],
-h6 a[href^="${HIGHLIGHT_LINK}"] {
+${headingSemanticInherit} {
 	font-size: inherit !important;
 	font-weight: inherit !important;
 	font-style: inherit !important;
@@ -1311,77 +1342,10 @@ h6 a[href^="${HIGHLIGHT_LINK}"] {
 	font-family: inherit !important;
 }
 /* Thymer applies heading size to .lineitem-text, not the parent .line-div — inherit on the <a> stays body-sized.
-   Match each heading level explicitly and override .lineitem-linkobj monospace. */
-.line-div.heading-h1 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div.heading-h1 a[href^="${HIGHLIGHT_LINK}"] {
-	font-size: 2rem !important;
-	font-weight: 700 !important;
-	font-style: normal !important;
-	line-height: 1.2 !important;
-	letter-spacing: inherit !important;
-	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.line-div.heading-h2 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div.heading-h2 a[href^="${HIGHLIGHT_LINK}"] {
-	font-size: 1.65rem !important;
-	font-weight: 650 !important;
-	font-style: normal !important;
-	line-height: 1.22 !important;
-	letter-spacing: inherit !important;
-	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.line-div.heading-h3 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div.heading-h3 a[href^="${HIGHLIGHT_LINK}"] {
-	font-size: 1.35rem !important;
-	font-weight: 600 !important;
-	font-style: normal !important;
-	line-height: 1.25 !important;
-	letter-spacing: inherit !important;
-	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.line-div.heading-h4 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div.heading-h4 a[href^="${HIGHLIGHT_LINK}"] {
-	font-size: 1.2rem !important;
-	font-weight: 600 !important;
-	font-style: normal !important;
-	line-height: 1.28 !important;
-	letter-spacing: inherit !important;
-	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.line-div.heading-h5 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div.heading-h5 a[href^="${HIGHLIGHT_LINK}"] {
-	font-size: 1.05rem !important;
-	font-weight: 600 !important;
-	font-style: normal !important;
-	line-height: 1.3 !important;
-	letter-spacing: inherit !important;
-	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.line-div.heading-h6 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}"],
-.line-div.heading-h6 a[href^="${HIGHLIGHT_LINK}"] {
-	font-size: 0.95rem !important;
-	font-weight: 600 !important;
-	font-style: normal !important;
-	line-height: 1.32 !important;
-	letter-spacing: inherit !important;
-	font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
-}
-.line-div.heading-h1 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h1 a[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h2 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h2 a[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h3 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h3 a[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h4 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h4 a[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h5 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h5 a[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h6 a.lineitem-linkobj[href^="${HIGHLIGHT_LINK}#st=italic"],
-.line-div.heading-h6 a[href^="${HIGHLIGHT_LINK}#st=italic"] {
-	font-style: italic !important;
-}
+ Match each heading level explicitly and override .lineitem-linkobj monospace. */
+${buildHeadingHighlightRules(L)}
 @media (prefers-color-scheme: dark) {
-	a[href^="${HIGHLIGHT_LINK}"] {
+	a[href^="${L}"] {
 		background-color: #3d3428;
 		border-color: #5c4f38;
 		color: #f2e8c8 !important;
@@ -1420,6 +1384,157 @@ function looksLikeUuid(s) {
 		typeof s === "string" &&
 		/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.trim())
 	);
+}
+
+/**
+ * Record/workspace ids from Thymer (and the highlight index JSON) are often base32-style
+ * strings, not RFC UUIDs. Accept those for the title-lookup palette command only.
+ */
+function looksLikePlausibleRecordIdForTitleLookup(s) {
+	if (typeof s !== "string") return false;
+	const t = s.trim();
+	if (!t) return false;
+	if (looksLikeUuid(t)) return true;
+	return t.length >= 16 && t.length <= 64 && /^[0-9A-Za-z]+$/.test(t);
+}
+
+/**
+ * @param {Iterable<unknown>} records from data.getAllRecords()
+ * @param {string} wantId record id from getGuid / local index (any casing)
+ * @returns {object|null} matching record or null
+ */
+function findWorkspaceRecordByGuid(records, wantId) {
+	const want = String(wantId).trim().toLowerCase();
+	if (!want) return null;
+	for (const record of records) {
+		let rg = "";
+		try {
+			rg = String(record.getGuid?.() ?? record.guid ?? "").trim();
+		} catch (_) {}
+		if (rg && rg.toLowerCase() === want) return record;
+	}
+	return null;
+}
+
+/**
+ * @param {unknown} raw result of data.getAllRecords()
+ * @returns {Promise<object[]>}
+ */
+async function coerceRecordsArray(raw) {
+	let v = raw;
+	if (v != null && typeof v.then === "function") {
+		try {
+			v = await v;
+		} catch (_) {
+			return [];
+		}
+	}
+	if (v == null) return [];
+	if (Array.isArray(v)) return v;
+	if (typeof v === "object") {
+		if (Array.isArray(v.records)) return v.records;
+		if (Array.isArray(v.items)) return v.items;
+	}
+	if (typeof v[Symbol.iterator] === "function") {
+		try {
+			return [...v];
+		} catch (_) {
+			return [];
+		}
+	}
+	return [];
+}
+
+/**
+ * @param {object} data plugin data
+ * @param {string} id
+ * @returns {Promise<object|null>}
+ */
+async function tryDataFetchRecordById(data, id) {
+	const trimmed = String(id ?? "").trim();
+	if (!data || !trimmed) return null;
+	for (const method of ["getRecord", "getRecordByGuid", "getRecordById", "findRecord"]) {
+		const fn = data[method];
+		if (typeof fn !== "function") continue;
+		try {
+			let r = fn.call(data, trimmed);
+			if (r != null && typeof r.then === "function") r = await r;
+			if (r && typeof r === "object") return r;
+		} catch (_) {}
+	}
+	return null;
+}
+
+/**
+ * @param {object} record
+ * @returns {Promise<string>}
+ */
+async function resolveRecordDisplayTitle(record) {
+	if (!record) return "";
+	const asText = (v) => {
+		if (v == null || (typeof v === "object" && typeof v.then === "function")) return "";
+		const s = String(v).trim();
+		return s;
+	};
+	const tryMethod = async (name) => {
+		try {
+			const fn = record[name];
+			if (typeof fn !== "function") return "";
+			let r = fn.call(record);
+			if (r != null && typeof r.then === "function") r = await r;
+			return asText(r);
+		} catch (_) {
+			return "";
+		}
+	};
+	for (const m of ["getName", "getTitle", "getLabel"]) {
+		const t = await tryMethod(m);
+		if (t) return t;
+	}
+	for (const key of ["name", "title", "label"]) {
+		try {
+			const t = asText(record[key]);
+			if (t) return t;
+		} catch (_) {}
+	}
+	const fromLine = await tryTitleFromFirstLine(record);
+	return fromLine;
+}
+
+/**
+ * Visible “title” for notes that only have a headline in the first line.
+ * @param {object} record
+ * @returns {Promise<string>}
+ */
+async function tryTitleFromFirstLine(record) {
+	try {
+		const items = await record.getLineItems(false);
+		const first = items && items[0];
+		if (!first?.segments?.length) return "";
+		let out = "";
+		for (const seg of first.segments) {
+			if (typeof seg.text === "string") out += seg.text;
+		}
+		out = out.trim().replace(/\s+/g, " ");
+		if (!out) return "";
+		if (out.length > 100) return `${out.slice(0, 97)}…`;
+		return out;
+	} catch (_) {
+		return "";
+	}
+}
+
+/** True if id is a top-level workspace key in the highlight index (outer JSON key — not a note id). */
+function pastedIdIsHighlightIndexWorkspaceKeyOnly(id) {
+	const t = String(id ?? "").trim();
+	if (!t) return false;
+	try {
+		const all = loadRecordsWithHighlightsMap();
+		const bucket = all[t];
+		return bucket != null && typeof bucket === "object" && !Array.isArray(bucket);
+	} catch (_) {
+		return false;
+	}
 }
 
 function walkNavForGuids(value, out, depth) {
@@ -2721,7 +2836,6 @@ class Plugin extends AppPlugin {
 		this._skipHighlightOnce = new Set();
 		this._markerRestoreSkipClearTimeouts = [];
 		this._recordHighlightIndexTimers = new Map();
-		this._globalHighlightGuidsFn = null;
 		this._recentSelectionGuidsFromEvents = new Set();
 		this._lastTextSelectionLineGuids = new Set();
 		this._frozenTextSelection = null;
@@ -2737,97 +2851,91 @@ class Plugin extends AppPlugin {
 		this._handlerCreated = this.events.on("lineitem.created", onLine, opts);
 		this._handlerUpdated = this.events.on("lineitem.updated", onLine, opts);
 
-		this._cmdUnwrapPlainSel = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Selection: plain text (strip == highlight links)",
-			icon: "eraser",
-			onSelected: () => {
-				void this._unwrapHighlightsInActiveNote("plain", "selection");
+		/** @type {{ remove(): void }[]} */
+		this._paletteCommands = [
+			{
+				label: "Highlighter: Selection: plain text (strip == highlight links)",
+				icon: "eraser",
+				onSelected: () => {
+					void this._unwrapHighlightsInActiveNote("plain", "selection");
+				},
 			},
-		});
-		this._cmdRestoreMarkersAllWorkspace = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: All notes: literal ==…== for Markdown export",
-			icon: "refresh",
-			onSelected: () => {
-				void this._restoreMarkersInAllWorkspaceRecords();
+			{
+				label: "Highlighter: All notes: literal ==…== for Markdown export",
+				icon: "refresh",
+				onSelected: () => {
+					void this._restoreMarkersInAllWorkspaceRecords();
+				},
 			},
-		});
-		this._cmdRebuildHighlightRecordIndex = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Rebuild local index of notes with highlight links",
-			icon: "list",
-			onSelected: () => {
-				void this._rebuildWorkspaceHighlightRecordIndex();
+			{
+				label: "Highlighter: Rebuild local index of notes with highlight links",
+				icon: "list",
+				onSelected: () => {
+					void this._rebuildWorkspaceHighlightRecordIndex();
+				},
 			},
-		});
-		this._cmdUnwrapMarkersWhole = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: This note: literal ==…== for Markdown export",
-			icon: "refresh",
-			onSelected: () => {
-				void this._unwrapHighlightsInActiveNote("markers", "whole");
+			{
+				label: "Highlighter: This note: literal ==…== for Markdown export",
+				icon: "refresh",
+				onSelected: () => {
+					void this._unwrapHighlightsInActiveNote("markers", "whole");
+				},
 			},
-		});
-		this._cmdUnwrapPlainWhole = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: This note: plain text (strip == highlight links)",
-			icon: "eraser",
-			onSelected: () => {
-				void this._unwrapHighlightsInActiveNote("plain", "whole");
+			{
+				label: "Highlighter: This note: plain text (strip == highlight links)",
+				icon: "eraser",
+				onSelected: () => {
+					void this._unwrapHighlightsInActiveNote("plain", "whole");
+				},
 			},
-		});
-		this._cmdDisableHighlightDetection = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Disable ==…== → highlight auto-convert",
-			icon: "ban",
-			onSelected: () => {
-				if (!this._highlightDetectionEnabled) {
-					this.ui.addToaster({
-						title: "Highlighter",
-						message: "== highlight auto-detection is already off.",
-						dismissible: true,
-						autoDestroyTime: 4500,
-					});
-					return;
-				}
-				this._highlightDetectionEnabled = false;
-				persistHighlightDetectionEnabled(this, false);
-				this.ui.addToaster({
-					title: "Highlighter",
-					message:
+			{
+				label: "Highlighter: Disable ==…== → highlight auto-convert",
+				icon: "ban",
+				onSelected: () => {
+					if (!this._highlightDetectionEnabled) {
+						highlighterToaster(this.ui, "== highlight auto-detection is already off.", {
+							autoDestroyTime: 4500,
+						});
+						return;
+					}
+					this._highlightDetectionEnabled = false;
+					persistHighlightDetectionEnabled(this, false);
+					highlighterToaster(
+						this.ui,
 						"== highlight auto-detection is off. Existing highlights stay; new == won't convert until you turn it back on.",
-					dismissible: true,
-					autoDestroyTime: 6500,
-				});
+						{ autoDestroyTime: 6500 },
+					);
+				},
 			},
-		});
-		this._cmdEnableHighlightDetection = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Enable ==…== → highlight auto-convert",
-			icon: "highlight",
-			onSelected: () => {
-				if (this._highlightDetectionEnabled) {
-					this.ui.addToaster({
-						title: "Highlighter",
-						message: "== highlight auto-detection is already on.",
-						dismissible: true,
-						autoDestroyTime: 4500,
-					});
-					return;
-				}
-				this._highlightDetectionEnabled = true;
-				persistHighlightDetectionEnabled(this, true);
-				const panel = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
-				void this._scanRecordLineItemsForHighlights(panel);
-				this.ui.addToaster({
-					title: "Highlighter",
-					message: "== highlight auto-detection is on. The open note was rescanned.",
-					dismissible: true,
-					autoDestroyTime: 5500,
-				});
+			{
+				label: "Highlighter: Enable ==…== → highlight auto-convert",
+				icon: "highlight",
+				onSelected: () => {
+					if (this._highlightDetectionEnabled) {
+						highlighterToaster(this.ui, "== highlight auto-detection is already on.", {
+							autoDestroyTime: 4500,
+						});
+						return;
+					}
+					this._highlightDetectionEnabled = true;
+					persistHighlightDetectionEnabled(this, true);
+					const panel = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
+					void this._scanRecordLineItemsForHighlights(panel);
+					highlighterToaster(
+						this.ui,
+						"== highlight auto-detection is on. The open note was rescanned.",
+						{ autoDestroyTime: 5500 },
+					);
+				},
 			},
-		});
-		this._cmdUnwrapMarkersSel = this.ui.addCommandPaletteCommand({
-			label: "Highlighter: Selection: literal ==…== for Markdown export",
-			icon: "refresh",
-			onSelected: () => {
-				void this._unwrapHighlightsInActiveNote("markers", "selection");
+			{
+				label: "Highlighter: Selection: literal ==…== for Markdown export",
+				icon: "refresh",
+				onSelected: () => {
+					void this._unwrapHighlightsInActiveNote("markers", "selection");
+				},
 			},
-		});
+		].map((spec) => this.ui.addCommandPaletteCommand(spec));
 
 		const onPanel = (ev) => {
 			const panel = ev.panel;
@@ -2931,11 +3039,6 @@ class Plugin extends AppPlugin {
 			const panel = getEditorPanelForSelection(this.ui) ?? this.ui.getActivePanel();
 			ensureEditorDocumentSelectionListeners(this, panel);
 		}, 0);
-
-		this._globalHighlightGuidsFn = () => getWorkspaceHighlightRecordGuids(this);
-		if (typeof globalThis !== "undefined") {
-			globalThis.thymerHighlighterGetHighlightRecordGuids = this._globalHighlightGuidsFn;
-		}
 	}
 
 	onUnload() {
@@ -2944,14 +3047,8 @@ class Plugin extends AppPlugin {
 		if (this._handlerPanelNavigated) this.events.off(this._handlerPanelNavigated);
 		if (this._handlerPanelFocused) this.events.off(this._handlerPanelFocused);
 		if (this._handlerReload) this.events.off(this._handlerReload);
-		this._cmdUnwrapPlainSel?.remove();
-		this._cmdRestoreMarkersAllWorkspace?.remove();
-		this._cmdRebuildHighlightRecordIndex?.remove();
-		this._cmdUnwrapMarkersWhole?.remove();
-		this._cmdUnwrapPlainWhole?.remove();
-		this._cmdDisableHighlightDetection?.remove();
-		this._cmdEnableHighlightDetection?.remove();
-		this._cmdUnwrapMarkersSel?.remove();
+		for (const cmd of this._paletteCommands ?? []) cmd?.remove();
+		this._paletteCommands = [];
 		for (const tid of this._markerRestoreSkipClearTimeouts || []) clearTimeout(tid);
 		this._markerRestoreSkipClearTimeouts = [];
 		clearTimeout(this._selectionGuidsFromEventClearT);
@@ -2967,12 +3064,6 @@ class Plugin extends AppPlugin {
 		if (this._selSnapRaf) cancelAnimationFrame(this._selSnapRaf);
 		for (const tid of this._recordHighlightIndexTimers?.values() ?? []) clearTimeout(tid);
 		this._recordHighlightIndexTimers?.clear();
-		if (typeof globalThis !== "undefined" && this._globalHighlightGuidsFn) {
-			if (globalThis.thymerHighlighterGetHighlightRecordGuids === this._globalHighlightGuidsFn) {
-				delete globalThis.thymerHighlighterGetHighlightRecordGuids;
-			}
-		}
-		this._globalHighlightGuidsFn = null;
 	}
 
 	_scheduleRecordHighlightIndexUpdate(record) {
@@ -2991,27 +3082,79 @@ class Plugin extends AppPlugin {
 		this._recordHighlightIndexTimers.set(rg, tid);
 	}
 
+	/**
+	 * Prompts for a record id; resolves title via several SDK hooks (incl. async getName).
+	 * Intentionally not registered as a palette command; keep for devtools / future use.
+	 */
+	async _lookupRecordTitleByGuidFromPrompt() {
+		if (typeof window === "undefined" || typeof window.prompt !== "function") {
+			highlighterToaster(this.ui, "Prompt is not available in this environment.");
+			return;
+		}
+		const raw = window.prompt("Paste a note (record) id (from local index JSON or getGuid):", "");
+		if (raw == null) return;
+		const guid = String(raw).trim();
+		if (!guid) {
+			highlighterToaster(this.ui, "No GUID entered.");
+			return;
+		}
+		if (!looksLikePlausibleRecordIdForTitleLookup(guid)) {
+			highlighterToaster(
+				this.ui,
+				"That does not look like a Thymer record id (paste from the highlight index JSON, or a standard UUID). Line item ids from the editor are different.",
+				{ autoDestroyTime: 9000 },
+			);
+			return;
+		}
+		let recordsRaw;
+		try {
+			recordsRaw = this.data.getAllRecords?.();
+		} catch (_) {
+			highlighterToaster(this.ui, "Could not read workspace notes.");
+			return;
+		}
+		const records = await coerceRecordsArray(recordsRaw);
+		if (!records.length) {
+			highlighterToaster(this.ui, "No notes found in this workspace (getAllRecords returned nothing usable).");
+			return;
+		}
+		let record = findWorkspaceRecordByGuid(records, guid);
+		if (!record) record = await tryDataFetchRecordById(this.data, guid);
+		if (!record) {
+			if (pastedIdIsHighlightIndexWorkspaceKeyOnly(guid)) {
+				highlighterToaster(
+					this.ui,
+					"You pasted the workspace id (the outer key in the highlight index). Expand it and paste one of the inner note ids.",
+					{ autoDestroyTime: 12000 },
+				);
+			} else {
+				highlighterToaster(
+					this.ui,
+					`No note with id ${guid}. Check you used an inner record key from the index, not the outer workspace key.`,
+					{ autoDestroyTime: 12000 },
+				);
+			}
+			return;
+		}
+		const title = await resolveRecordDisplayTitle(record);
+		const label = title || "(no title from SDK)";
+		highlighterToaster(this.ui, `${label} — ${guid}`, {
+			title: "Highlighter — record title",
+			autoDestroyTime: 12000,
+		});
+	}
+
 	/** Rescan every workspace note and refresh {@link LS_KEY_RECORDS_WITH_HIGHLIGHTS} for this browser. */
 	async _rebuildWorkspaceHighlightRecordIndex() {
 		let records;
 		try {
 			records = this.data.getAllRecords?.();
 		} catch (_) {
-			this.ui.addToaster({
-				title: "Highlighter",
-				message: "Could not read workspace notes.",
-				dismissible: true,
-				autoDestroyTime: 5000,
-			});
+			highlighterToaster(this.ui, "Could not read workspace notes.");
 			return;
 		}
 		if (!records?.length) {
-			this.ui.addToaster({
-				title: "Highlighter",
-				message: "No notes found in this workspace.",
-				dismissible: true,
-				autoDestroyTime: 5000,
-			});
+			highlighterToaster(this.ui, "No notes found in this workspace.");
 			return;
 		}
 		let withHits = 0;
@@ -3020,12 +3163,11 @@ class Plugin extends AppPlugin {
 				if (await recomputeAndStoreRecordHighlightFlag(this, record)) withHits++;
 			} catch (_) {}
 		}
-		this.ui.addToaster({
-			title: "Highlighter — index rebuilt",
-			message: `${records.length} note(s) scanned. ${withHits} note(s) listed as containing highlight links (browser-local; see README).`,
-			dismissible: true,
-			autoDestroyTime: 9000,
-		});
+		highlighterToaster(
+			this.ui,
+			`${records.length} note(s) scanned. ${withHits} note(s) listed as containing highlight links (browser-local; see README).`,
+			{ title: "Highlighter — index rebuilt", autoDestroyTime: 9000 },
+		);
 	}
 
 	_scheduleSelectionSnapshot() {
@@ -3079,91 +3221,18 @@ class Plugin extends AppPlugin {
 		try {
 			records = this.data.getAllRecords?.();
 		} catch (_) {
-			this.ui.addToaster({
-				title: "Highlighter",
-				message: "Could not read workspace notes.",
-				dismissible: true,
-				autoDestroyTime: 5000,
-			});
+			highlighterToaster(this.ui, "Could not read workspace notes.");
 			return;
 		}
 		if (!records?.length) {
-			this.ui.addToaster({
-				title: "Highlighter",
-				message: "No notes found in this workspace.",
-				dismissible: true,
-				autoDestroyTime: 5000,
-			});
+			highlighterToaster(this.ui, "No notes found in this workspace.");
 			return;
 		}
 
-		const dryRun = readWorkspaceMarkdownExportDryRun();
 		const n = records.length;
-		this.ui.addToaster({
-			title: "Highlighter",
-			message: dryRun
-				? `Dry-run started: ${n} note(s). No writes — counting lines with == highlight links only. Open the browser console for per-note detail.`
-				: `Started: scanning ${n} note(s) for highlight links…`,
-			dismissible: true,
-			autoDestroyTime: dryRun ? 8000 : 5000,
+		highlighterToaster(this.ui, `Started: scanning ${n} note(s) for highlight links…`, {
+			autoDestroyTime: 5000,
 		});
-
-		if (dryRun) {
-			let notesWithHits = 0;
-			let linesWithHighlights = 0;
-			/** @type {{ noteName: string, noteGuid: string, lineGuids: string[], lineCount: number }[]} */
-			const report = [];
-			for (const record of records) {
-				let noteGuid = "";
-				try {
-					noteGuid = String(record.getGuid?.() ?? record.guid ?? "").trim();
-				} catch (_) {}
-				try {
-					const items = await record.getLineItems(false);
-					const byG = lineItemsByGuidMap(items);
-					const hitGuids = [];
-					for (const item of items) {
-						if (lineItemHasOurHighlightLink(item, byG)) {
-							hitGuids.push(item.guid);
-							linesWithHighlights++;
-						}
-					}
-					if (noteGuid) setWorkspaceRecordHasHighlightLinks(this, noteGuid, hitGuids.length > 0);
-					if (hitGuids.length) {
-						notesWithHits++;
-						let noteName = "";
-						try {
-							noteName = record.getName?.() ?? "";
-						} catch (_) {}
-						report.push({
-							noteName: noteName || "(untitled)",
-							noteGuid,
-							lineGuids: hitGuids,
-							lineCount: hitGuids.length,
-						});
-					}
-				} catch (_) {}
-			}
-			if (typeof console !== "undefined" && console.log) {
-				console.log("[Highlighter] workspace Markdown export dry-run", {
-					notesScanned: n,
-					notesWithHighlightLines: notesWithHits,
-					lineItemsWithHighlightLinks: linesWithHighlights,
-					perNote: report,
-				});
-			}
-			const sample =
-				report.length <= 3
-					? report.map((r) => `${r.noteName}: ${r.lineCount} line(s)`).join(" · ")
-					: `${report.length} notes (see console for names & line GUIDs)`;
-			this.ui.addToaster({
-				title: "Highlighter — dry-run done",
-				message: `${n} note(s) scanned. ${notesWithHits} note(s) with ${linesWithHighlights} line item(s) containing highlight links. ${sample}`,
-				dismissible: true,
-				autoDestroyTime: 12000,
-			});
-			return;
-		}
 
 		const allMarkerGuids = [];
 		let recordsConverted = 0;
@@ -3192,12 +3261,7 @@ class Plugin extends AppPlugin {
 				: recordsConverted === 1
 					? "Converted highlight links to == markers in 1 note."
 					: `Converted highlight links to == markers in ${recordsConverted} notes.`;
-		this.ui.addToaster({
-			title: "Highlighter",
-			message: `${reviewedPhrase} ${changedPhrase}`,
-			dismissible: true,
-			autoDestroyTime: 7500,
-		});
+		highlighterToaster(this.ui, `${reviewedPhrase} ${changedPhrase}`, { autoDestroyTime: 7500 });
 	}
 	/**
 	 * @param {"plain" | "markers"} mode

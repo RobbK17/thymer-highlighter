@@ -2,7 +2,7 @@
 
 Thymer plugin that treats `==highlighted text==` like Obsidian-style markers: it turns those segments into soft yellow highlights in the editor. Thymer does not ship a native highlight segment type, so the plugin stores highlights as styled link segments and injects matching CSS.
 
-**Version:** `1.0.4` (in `plugin.json` as `version`). The `ver` field is the manifest / API version expected by Thymer. The same number appears as `PLUGIN_VERSION` at the top of `plugin.js` — keep them aligned when releasing.
+**Version:** `1.0.5` (in `plugin.json` as `version`). The `ver` field is the manifest / API version expected by Thymer. The same number appears as `PLUGIN_VERSION` at the top of `plugin.js` — keep them aligned when releasing.
 
 ## Features
 
@@ -12,9 +12,10 @@ Thymer plugin that treats `==highlighted text==` like Obsidian-style markers: it
 - **Scan on load** — Opening a note, focusing the editor, or reloading the plugin can rescan the open page for `==…==` (when auto-detection is on).
 - **Auto-detection toggle** — **Highlighter: Enable ==…== → highlight auto-convert** / **Highlighter: Disable ==…== → highlight auto-convert** turn that behavior on or off (**default: on**). The setting is stored in **`localStorage`** (keyed per plugin instance in the workspace) and survives reload. A **toaster** confirms the result (including “already on/off” if the command doesn’t change state). Manual palette actions still run when conversion is off.
 - **Current selection** — Several actions target the **current editor selection** using cached selection geometry, pointer bands, and related signals so they still work after the command palette takes focus.
-- **Workspace bulk export** — **Highlighter: All notes: literal ==…== for Markdown export** walks every note from `data.getAllRecords()`, applies the same “highlight link → literal `==…==` in source” rules as the per-note command (including cross-line chains per record), then shows a **toaster** with how many notes were **reviewed** and how many had **at least one line** converted.
-- **Browser-local “which notes have highlights?” index** — Thymer’s public plugin SDK has no invisible per-note metadata field, so the plugin maintains a **localStorage** map keyed by **workspace GUID** → **record GUID** for notes that **currently** contain highlight links that pass the same heuristics as export / dry-run (syntax blocks and quote rows excluded, etc.). It updates on a short debounce after highlight-related edits, when you unwrap or bulk-convert, and when you run **Highlighter: Rebuild local index of notes with highlight links**. **Dry-run** workspace export also refreshes this map (no note writes). The map lives under the app **origin** (like other `localStorage`): removing and reinstalling the plugin does not erase it, but **clear cookies / site data** for Thymer does — after that, run **Rebuild local index** (or rely on edits) to repopulate. The data **does not sync** across browsers or devices; treat it as a filter hint, not proof.
-- **Command palette** — Several **Highlighter:** commands switch between **plain text** (strip highlight links) and **literal `==…==`** in the line source for Markdown-style portability (see below).
+- **Workspace bulk export** — **Highlighter: All notes: literal ==…== for Markdown export** walks every note from `data.getAllRecords()`, applies the same “highlight link → literal `==…==` in source” rules as the per-note command (including cross-line chains per record), then shows a **toaster** with how many notes were **reviewed** and how many had **at least one line** converted. Workspace export **dry-run** (`thymerHighlighter:workspaceMarkdownExportDryRun`) has been **removed**; use **Rebuild local index** for a read-only full scan + index refresh only.
+- **Browser-local “which notes have highlights?” index** — Thymer’s public plugin SDK has no invisible per-note metadata field, so the plugin maintains a **`localStorage`** map (`thymerHighlighter:recordsWithHighlights:v1`) keyed by **workspace id** (`getWorkspaceGuid`) → **record id** → last time that note was marked as containing highlight links that pass the same heuristics as export (syntax blocks and quote rows excluded, etc.). Thymer often uses **base32-style** ids, not RFC UUIDs. The index updates on a short debounce after highlight-related edits, when you unwrap or bulk-convert, and when you run **Highlighter: Rebuild local index of notes with highlight links**. It does **not** sync across browsers or devices; clearing **site data** clears it — run **Rebuild local index** (or rely on edits) afterward. Treat it as a filter hint, not proof.
+- **Record title lookup (code only)** — The `Plugin` method **`_lookupRecordTitleByGuidFromPrompt()`** prompts for a **record id** (inner key from the highlight index JSON, or standard UUID), normalizes **`getAllRecords()`** when it returns a Promise or a wrapped list, resolves a title via **`getName` / `getTitle` / similar**, **async** APIs, optional **`data.getRecord`…**-style fetch if listing misses, and a **first-line text** fallback. It is **not** registered in the command palette; use from devtools if you expose the plugin instance, or re-register in `_paletteCommands` during development.
+- **Command palette** — **Eight** **Highlighter:** commands for converting to/from literal `==…==`, stripping highlight links, toggling auto-detect, and rebuilding the local index (see below).
 
 ## Markdown compatibility if you stop using the plugin
 
@@ -36,13 +37,13 @@ Avoid wrapping inside unsupported segment types (for example code, links, mentio
 
 Open the command palette and search for `Highlighter:`.
 
-Commands are registered in the order below. **Thymer may reorder palette hits** (search ranking, locale rules, etc.) — the list here is the **intended** sequence and naming.
+Commands are registered in the order below. **Thymer may reorder palette hits** (search ranking, locale rules, etc.) — the list here is the **intended** sequence and naming. There is **no** palette command for record-title lookup; that behavior exists only as **`_lookupRecordTitleByGuidFromPrompt`** in `plugin.js` (see **Development**).
 
 | Command | Effect |
 |--------|--------|
 | **Highlighter: Selection: plain text (strip == highlight links)** | Removes highlight links for lines in the current editor selection (cached after focus moves). |
 | **Highlighter: All notes: literal ==…== for Markdown export** | Workspace-wide: write literal `==…==` in source from highlight links; toaster summarizes reviewed vs. changed notes. |
-| **Highlighter: Rebuild local index of notes with highlight links** | Rescans every note and refreshes the browser-local map (`thymerHighlighter:recordsWithHighlights:v1` in **localStorage**). Use after install, clearing site data, or if the list feels stale. |
+| **Highlighter: Rebuild local index of notes with highlight links** | Rescans every note and refreshes the browser-local map (`thymerHighlighter:recordsWithHighlights:v1`). Use after install, clearing site data, or if the list feels stale. |
 | **Highlighter: This note: literal ==…== for Markdown export** | Whole note: highlight links → literal `==…==` in the line text. |
 | **Highlighter: This note: plain text (strip == highlight links)** | Whole note: remove highlight links, leave plain visible text. |
 | **Highlighter: Disable ==…== → highlight auto-convert** | Turns off auto-convert while typing (**persisted**). Toaster confirms (or “already off”). Existing highlights stay; new `==…==` won’t become highlight links until you enable again. |
@@ -53,6 +54,7 @@ Selection-scoped commands infer rows using the selection, cached geometry, point
 
 ## Changelog
 
+- **1.0.5** — Removed workspace export **dry-run** Internal refactors: heading-row highlight CSS from `HIGHLIGHT_HEADING_LEVELS` (`buildHeadingHighlightRules`); **`highlighterToaster`** for notifications; palette commands from a single **`_paletteCommands`** spec array (**eight** commands; record title lookup `_lookupRecordTitleByGuidFromPrompt` and helpers remain in source but are not registered in the palette). README documents commands, local index shape (workspace id vs record id), and development helpers.
 - **1.0.4** — Bold/italic highlight display (`#st=` href fragments + CSS); `==` detection across adjacent bold/italic cells; `sourceSegmentType` sync runs even when auto-convert is off; neighbor sync skips whitespace-only segments. Version bump and README updates.
 - **1.0.3** — Version aligned across `plugin.json`, `PLUGIN_VERSION`, and README; README clarifies localStorage / site-data behavior for the highlight index.
 
@@ -63,22 +65,23 @@ Install this folder as a Thymer app plugin according to Thymer’s plugin docume
 ## Files
 
 - **`plugin.json`** — Plugin manifest (name, version, icon, description).
-- **`plugin.js`** — Implementation (`AppPlugin` class); release version is also in the `PLUGIN_VERSION` constant (keep in sync with `plugin.json`).
+- **`plugin.js`** — Implementation (`AppPlugin` class): segment/CSS logic, selection helpers, and commands in one file; **`PLUGIN_VERSION`** at the top (keep in sync with `plugin.json`).
 
 ## Development
 
 For SDK hot reload with a bundler that expects ESM exports, you may need to add `export` before the `Plugin` class declaration in `plugin.js` (see comment at the top of that file).
 
-**Workspace export dry-run (no writes)** — To see which notes and line items contain this plugin’s highlight link segments without calling `setSegments` or running cross-line rewrites, run in the browser devtools console:
+**Internals (for contributors)** — Shipping artifact remains a single `plugin.js`. Notable structure:
+
+- **Palette commands** — Definitions are a single array in `Plugin.onLoad`, mapped to `addCommandPaletteCommand`; `onUnload` removes every handle in `_paletteCommands` (currently **eight** commands; record title lookup is intentionally omitted from this array).
+- **Toasters** — `highlighterToaster(ui, message, options)` wraps `addToaster` with defaults (`title`, `dismissible`, `autoDestroyTime`).
+- **Heading highlight CSS** — Rules for `.line-div.heading-h1` … `h6` are built from **`HIGHLIGHT_HEADING_LEVELS`** (`buildHeadingHighlightRules`) so typography stays in one table.
+- **Record title lookup (not in palette)** — **`_lookupRecordTitleByGuidFromPrompt`**, with **`coerceRecordsArray`**, **`tryDataFetchRecordById`**, **`findWorkspaceRecordByGuid`**, **`looksLikePlausibleRecordIdForTitleLookup`** (UUIDs and Thymer-style ids), **`resolveRecordDisplayTitle`**, **`tryTitleFromFirstLine`**, **`pastedIdIsHighlightIndexWorkspaceKeyOnly`** (detects pasting the **outer** workspace key instead of an inner record id).
+
+**Inspecting the highlight index** — DevTools → **Application** → **Local Storage** → Thymer origin → key **`thymerHighlighter:recordsWithHighlights:v1`**. JSON shape: **outer** keys = workspace id, **inner** keys = **record** (note) ids; values are numeric timestamps. Use **Highlighter: Rebuild local index…** after clearing site data or if the map looks wrong.
+
+**Quick console peek**
 
 ```js
-localStorage.setItem("thymerHighlighter:workspaceMarkdownExportDryRun", "1");
-```
-
-Then run **Highlighter: All notes: literal ==…== for Markdown export**. You get a toaster when the scan **starts** and when it **finishes**, and a structured `[Highlighter] workspace Markdown export dry-run` log with per-note names, GUIDs, and line GUIDs. The scan counts linkobjs that use the plugin sentinel URL **and** pass title heuristics: not an auto-link title equal to the href, not **email-style junk** (highlight body starting with `>` from quoted lines, prior sibling segment that is only `>` markers before the link, or only `=` underline characters), and (legacy) `sourceSegmentType` / title rules as before. Lines inside **syntax blocks** (including block children when the parent `block` has a language) and **`quote`-type** blockquote rows are excluded from the count. **Dry-run also updates** the browser-local highlight index (`thymerHighlighter:recordsWithHighlights:v1`) for each note scanned. Clear the flag with `localStorage.removeItem("thymerHighlighter:workspaceMarkdownExportDryRun")` or set `"0"` when you are ready to run a real export.
-
-**Devtools — list record GUIDs in the index** (current workspace, this browser):
-
-```js
-thymerHighlighterGetHighlightRecordGuids?.() ?? [];
+JSON.parse(localStorage.getItem("thymerHighlighter:recordsWithHighlights:v1") || "{}")
 ```
