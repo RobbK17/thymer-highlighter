@@ -19,7 +19,7 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.7";
+const PLUGIN_VERSION = "1.0.8";
 
 const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
 
@@ -1112,6 +1112,177 @@ async function snapshotEditorSelectionInto(plugin, panel) {
 	plugin._selectionGuidsFromEventClearT = setTimeout(() => {
 		plugin._recentSelectionGuidsFromEvents = new Set();
 	}, 15000);
+}
+
+function cloneSegmentForUnwrap(s) {
+	return { type: s.type, text: s.text };
+}
+
+/** True when every segment is inline text/bold/italic and trim-only (whitespace / ignorable chars). */
+function segmentsAreWhitespaceOnlyInline(segments) {
+	if (!segments?.length) return true;
+	for (const s of segments) {
+		const t = simpleNeighborType(s);
+		if (!t) return false;
+		if (segmentInlinePlainText(s).replace(/[\s\u00a0\u200B-\u200D\uFEFF]/g, "").length) return false;
+	}
+	return true;
+}
+
+/**
+ * One line item prepared for cross-line ==…== restore: a single contiguous highlight run, uniform #st= type,
+ * no stray highlights elsewhere on the line.
+ */
+function analyzeLineForCrossLineMarkerUnwrap(segments) {
+	if (!segments?.length) return null;
+	let lo = -1;
+	let hi = -1;
+	for (let i = 0; i < segments.length; i++) {
+		if (isOurHighlightSegment(segments[i])) {
+			if (highlightLinkobjHasEmailQuoteShimPrefix(segments, i)) return null;
+			if (lo < 0) lo = i;
+			hi = i;
+		}
+	}
+	if (lo < 0) return null;
+	for (let i = 0; i < lo; i++) {
+		if (isOurHighlightSegment(segments[i])) return null;
+	}
+	for (let i = hi + 1; i < segments.length; i++) {
+		if (isOurHighlightSegment(segments[i])) return null;
+	}
+	const highlightSegs = [];
+	for (let i = lo; i <= hi; i++) {
+		const s = segments[i];
+		if (isOurHighlightSegment(s)) {
+			highlightSegs.push(s);
+			continue;
+		}
+		const t = simpleNeighborType(s);
+		if (!t) return null;
+		if (segmentInlinePlainText(s).replace(/[\s\u00a0\u200B-\u200D\uFEFF]/g, "").length) return null;
+	}
+	const types = highlightSegs.map(highlightStoredSourceType);
+	const baseType = types[0];
+	if (!types.every((t) => t === baseType)) return null;
+	return {
+		lo,
+		hi,
+		baseType,
+		leadingSegs: segments.slice(0, lo).map(cloneSegmentForUnwrap),
+		trailingSegs: segments.slice(hi + 1).map(cloneSegmentForUnwrap),
+		highlightSegs,
+	};
+}
+
+function linesChainableForSingleMarkerSpan(prev, next) {
+	return (
+		segmentsAreWhitespaceOnlyInline(prev.trailingSegs) &&
+		segmentsAreWhitespaceOnlyInline(next.leadingSegs) &&
+		prev.baseType === next.baseType
+	);
+}
+
+/**
+ * @returns {Array<Array<AnalyzeRow & { item: object }>>}
+ * @typedef {ReturnType<typeof analyzeLineForCrossLineMarkerUnwrap>} AnalyzeRow
+ */
+function partitionCrossLineMarkerChains(fullItems, limitGuids, byG) {
+	/** @type {any[][]} */
+	const chains = [];
+	/** @type {any[]} */
+	let cur = [];
+	const flush = () => {
+		if (cur.length) chains.push(cur);
+		cur = [];
+	};
+	for (const item of fullItems) {
+		if (lineItemIsNonProseHighlightHost(item, byG) || !limitGuids.has(item.guid)) {
+			flush();
+			continue;
+		}
+		const row = analyzeLineForCrossLineMarkerUnwrap(item.segments);
+		if (!row) {
+			flush();
+			continue;
+		}
+		const entry = { ...row, item };
+		if (!cur.length) cur.push(entry);
+		else if (linesChainableForSingleMarkerSpan(cur[cur.length - 1], entry)) cur.push(entry);
+		else {
+			flush();
+			cur.push(entry);
+		}
+	}
+	flush();
+	return chains;
+}
+
+/**
+ * Emit one logical == span across line items (open on first row, close on last; newlines between rows).
+ * @returns {Map<string, object[]>|null} null if inner titles contain \\n and split would desync
+ */
+function tryBuildSegmentsForCrossLineMarkerChain(chain) {
+	const rawLines = chain.map((c) => c.highlightSegs.map((h) => highlightLinkTitle(h)).join(""));
+	const rawInner = rawLines.join("\n");
+	const escapedFull = escapeInnerForMarkers(rawInner);
+	const splitParts = escapedFull.split("\n");
+	if (splitParts.length !== chain.length) return null;
+	const baseType = chain[0].baseType;
+	const out = new Map();
+	const last = chain.length - 1;
+	for (let k = 0; k < chain.length; k++) {
+		const row = chain[k];
+		if (k === 0) {
+			const segs = [
+				...row.leadingSegs.map(cloneSegmentForUnwrap),
+				{ type: baseType, text: `==${splitParts[k]}` },
+			];
+			out.set(row.item.guid, segs);
+		} else if (k === last) {
+			const segs = [{ type: baseType, text: `${splitParts[k]}==` }, ...row.trailingSegs.map(cloneSegmentForUnwrap)];
+			out.set(row.item.guid, segs);
+		} else {
+			out.set(row.item.guid, [{ type: baseType, text: splitParts[k] }]);
+		}
+	}
+	return out;
+}
+
+/**
+ * @param {object[]} fullItems document order
+ * @param {Set<string>} limitGuids line items to convert (e.g. whole note or selection)
+ */
+function buildCrossLineMarkerUnwrapSegmentMap(fullItems, limitGuids, byG) {
+	const map = new Map();
+	const partition = partitionCrossLineMarkerChains(fullItems, limitGuids, byG);
+	for (const chain of partition) {
+		if (chain.length < 2) {
+			const it = chain[0].item;
+			const next = transformSegmentsUnwrap(it.segments, "markers");
+			if (next) map.set(it.guid, mergeAdjacentSameType(next));
+			continue;
+		}
+		const merged = tryBuildSegmentsForCrossLineMarkerChain(chain);
+		if (merged) {
+			for (const [guid, segs] of merged) {
+				map.set(guid, mergeAdjacentSameType(segs));
+			}
+		} else {
+			for (const row of chain) {
+				const it = row.item;
+				const next = transformSegmentsUnwrap(it.segments, "markers");
+				if (next) map.set(it.guid, mergeAdjacentSameType(next));
+			}
+		}
+	}
+	for (const item of fullItems) {
+		if (!limitGuids.has(item.guid) || lineItemIsNonProseHighlightHost(item, byG)) continue;
+		if (map.has(item.guid)) continue;
+		const next = transformSegmentsUnwrap(item.segments, "markers");
+		if (next) map.set(item.guid, mergeAdjacentSameType(next));
+	}
+	return map;
 }
 
 /**
@@ -3276,10 +3447,25 @@ class Plugin extends AppPlugin {
 	/**
 	 * @param {Array<{ guid: string, segments: object }>} targets line items to transform
 	 * @param {"plain" | "markers"} mode
+	 * @param {object[] | undefined} fullOrderedItems full note line list in document order (required for mode markers cross-line == spans)
 	 * @returns {Promise<{ markerGuids: string[] }>}
 	 */
-	async _unwrapTargetsToMode(targets, mode) {
+	async _unwrapTargetsToMode(targets, mode, fullOrderedItems) {
 		const markerGuids = [];
+		if (mode === "markers" && fullOrderedItems?.length) {
+			const limitGuids = new Set(targets.map((t) => t.guid));
+			const byG = lineItemsByGuidMap(fullOrderedItems);
+			const plan = buildCrossLineMarkerUnwrapSegmentMap(fullOrderedItems, limitGuids, byG);
+			for (const item of targets) {
+				const next = plan.get(item.guid);
+				if (!next) continue;
+				if (!segmentsDiffer(item.segments, next)) continue;
+				this._skipHighlightOnce.add(item.guid);
+				markerGuids.push(item.guid);
+				await item.setSegments(next);
+			}
+			return { markerGuids };
+		}
 		for (const item of targets) {
 			const next = transformSegmentsUnwrap(item.segments, mode);
 			if (!next) continue;
@@ -3334,6 +3520,7 @@ class Plugin extends AppPlugin {
 				const { markerGuids } = await this._unwrapTargetsToMode(
 					items.filter((it) => !lineItemIsNonProseHighlightHost(it, byG)),
 					"markers",
+					items,
 				);
 				if (markerGuids.length) recordsConverted++;
 				for (const g of markerGuids) allMarkerGuids.push(g);
@@ -3392,7 +3579,7 @@ class Plugin extends AppPlugin {
 			(it) => !lineItemIsNonProseHighlightHost(it, byG),
 		);
 
-		const { markerGuids } = await this._unwrapTargetsToMode(targets, mode);
+		const { markerGuids } = await this._unwrapTargetsToMode(targets, mode, items);
 		if (mode === "markers" && markerGuids.length) this._scheduleMarkerSkipClear(markerGuids);
 		this._scheduleRecordHighlightIndexUpdate(record);
 	}
