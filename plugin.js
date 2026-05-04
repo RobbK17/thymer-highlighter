@@ -19,7 +19,7 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.6";
+const PLUGIN_VERSION = "1.0.7";
 
 const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
 
@@ -750,12 +750,12 @@ function domWalkLineGuid(node, validGuids) {
  * Map a DOM Selection to line item guids.
  * Multi-line ranges often keep both endpoints under the first line’s DOM; we never treat ga === gb as “one line only”.
  */
-function lineGuidsFromDomTextSelection(sel, validGuids, orderedItems) {
+function lineGuidsFromDomTextSelection(sel, validGuids, orderedItems, panel) {
 	if (!sel?.rangeCount || !orderedItems?.length) return new Set();
-	return lineGuidsFromDomTextSelectionRange(sel.getRangeAt(0), validGuids, orderedItems);
+	return lineGuidsFromDomTextSelectionRange(sel.getRangeAt(0), validGuids, orderedItems, panel);
 }
 
-function lineGuidsFromDomTextSelectionRange(range, validGuids, orderedItems) {
+function lineGuidsFromDomTextSelectionRange(range, validGuids, orderedItems, panel) {
 	const out = new Set();
 	if (!range || !orderedItems?.length) return out;
 	if (range.collapsed) {
@@ -767,7 +767,11 @@ function lineGuidsFromDomTextSelectionRange(range, validGuids, orderedItems) {
 	const gb = domWalkLineGuid(range.endContainer, validGuids);
 	if (ga) out.add(ga);
 	if (gb) out.add(gb);
-	for (const g of lineGuidsFromRangePointSamplingRange(range, validGuids)) out.add(g);
+	const rootsForHit = panel ? collectPanelDomRoots(panel) : [];
+	for (const g of lineGuidsFromRangePointSamplingRange(range, validGuids, panel, rootsForHit)) out.add(g);
+	if (panel && rootsForHit.length && !range.collapsed && ga && gb && ga === gb) {
+		for (const g of lineGuidsFromVerticalStackSweepRange(range, validGuids, rootsForHit, panel)) out.add(g);
+	}
 	const idxs = [...out].map((g) => orderedItems.findIndex((it) => it.guid === g)).filter((i) => i >= 0);
 	if (idxs.length >= 2) {
 		const lo = Math.min(...idxs);
@@ -1073,12 +1077,12 @@ async function snapshotEditorSelectionInto(plugin, panel) {
 				roots.some((r) => selectionTouchesEditorRoot(sel, r)) ||
 				selectionBBoxIntersectsAnyRoot(sel, roots);
 			if (touches) {
-				for (const g of lineGuidsFromDomTextSelection(sel, valid, items)) merged.add(g);
+				for (const g of lineGuidsFromDomTextSelection(sel, valid, items, panel)) merged.add(g);
 				for (const root of roots) {
 					for (const g of lineGuidsFromSelectionRectOverlap(root, valid, sel)) merged.add(g);
 				}
-				for (const g of lineGuidsFromRangePointSampling(sel, valid)) merged.add(g);
-				for (const g of lineGuidsFromVerticalStackSweep(sel, valid, roots)) merged.add(g);
+				for (const g of lineGuidsFromRangePointSampling(sel, valid, panel)) merged.add(g);
+				for (const g of lineGuidsFromVerticalStackSweep(sel, valid, roots, panel)) merged.add(g);
 				for (const g of lineGuidsFromItemsIntersectingSelectionRect(items, valid, roots, sel)) merged.add(g);
 				if (!sel.getRangeAt(0).collapsed) {
 					await captureTextSelectionLinesForCommands(plugin, panel);
@@ -1701,9 +1705,11 @@ function selectionBBoxIntersectsAnyRoot(sel, roots) {
 	return false;
 }
 
-function lineGuidsFromRangePointSamplingRange(range, validGuids) {
+function lineGuidsFromRangePointSamplingRange(range, validGuids, panel, panelRoots) {
 	const out = new Set();
 	if (!range || !validGuids?.size || typeof document === "undefined") return out;
+	const roots =
+		panelRoots && panelRoots.length ? panelRoots : panel ? collectPanelDomRoots(panel) : [];
 	const rects = Array.from(range.getClientRects()).filter((cr) => cr.width >= 0 && cr.height >= 0);
 	const pts = [];
 	for (const cr of rects) {
@@ -1719,20 +1725,15 @@ function lineGuidsFromRangePointSamplingRange(range, validGuids) {
 		pts.push([cr.left + Math.max(1, cr.width) * 0.5, cr.top + Math.max(1, cr.height) * 0.5]);
 	}
 	for (const [x, y] of pts.slice(0, 48)) {
-		let hit = null;
-		try {
-			hit = document.elementFromPoint(x, y);
-		} catch (_) {
-			continue;
-		}
-		for (const g of guidsFromAncestorsDeep(hit, validGuids)) out.add(g);
+		for (const g of guidsFromClientPointMultiDoc(x, y, panel, range, validGuids, roots)) out.add(g);
 	}
 	return out;
 }
 
-function lineGuidsFromRangePointSampling(sel, validGuids) {
+function lineGuidsFromRangePointSampling(sel, validGuids, panel) {
 	if (!sel?.rangeCount || !validGuids?.size || typeof document === "undefined") return new Set();
-	return lineGuidsFromRangePointSamplingRange(sel.getRangeAt(0), validGuids);
+	const roots = panel ? collectPanelDomRoots(panel) : [];
+	return lineGuidsFromRangePointSamplingRange(sel.getRangeAt(0), validGuids, panel, roots);
 }
 
 function rootContainsDeep(root, el) {
@@ -1782,7 +1783,7 @@ function rangeAnchoredInEditorRoots(range, panel) {
 	}
 }
 
-function lineGuidsFromVerticalStackSweepRange(range, validGuids, panelRoots) {
+function lineGuidsFromVerticalStackSweepRange(range, validGuids, panelRoots, panel) {
 	const out = new Set();
 	if (!range || !validGuids?.size || !panelRoots?.length || typeof document === "undefined") {
 		return out;
@@ -1815,16 +1816,7 @@ function lineGuidsFromVerticalStackSweepRange(range, validGuids, panelRoots) {
 	for (let s = 0; s <= steps; s++) {
 		const y = minY + (h * s) / Math.max(1, steps) + 1;
 		for (const x of xsUse) {
-			let stack;
-			try {
-				stack = document.elementsFromPoint(x, y);
-			} catch (_) {
-				continue;
-			}
-			for (const el of stack || []) {
-				if (!panelRoots.some((r) => rootContainsDeep(r, el))) continue;
-				for (const g of guidsFromAncestorsDeep(el, validGuids)) out.add(g);
-			}
+			for (const g of guidsFromClientPointMultiDoc(x, y, panel, range, validGuids, panelRoots)) out.add(g);
 		}
 	}
 	return out;
@@ -1834,11 +1826,11 @@ function lineGuidsFromVerticalStackSweepRange(range, validGuids, panelRoots) {
  * Multi-line ranges often keep start/end in the first line’s subtree; walk Y with elementsFromPoint
  * so every row the highlight crosses is included.
  */
-function lineGuidsFromVerticalStackSweep(sel, validGuids, panelRoots) {
+function lineGuidsFromVerticalStackSweep(sel, validGuids, panelRoots, panel) {
 	if (!sel?.rangeCount || !validGuids?.size || !panelRoots?.length || typeof document === "undefined") {
 		return new Set();
 	}
-	return lineGuidsFromVerticalStackSweepRange(sel.getRangeAt(0), validGuids, panelRoots);
+	return lineGuidsFromVerticalStackSweepRange(sel.getRangeAt(0), validGuids, panelRoots, panel);
 }
 
 /**
@@ -2128,6 +2120,27 @@ function collectHitTestDocuments(panel, range) {
 		if (host?.tagName === "IFRAME" && host.contentDocument) add(host.contentDocument);
 	} catch (_) {}
 	return docs;
+}
+
+/** Hit-test (x,y) in every document that may host the editor (main + iframe); Thymer often renders the note body in an iframe. */
+function guidsFromClientPointMultiDoc(cx, cy, panel, range, validGuids, panelRoots) {
+	const out = new Set();
+	if (typeof cx !== "number" || typeof cy !== "number" || Number.isNaN(cx) || Number.isNaN(cy) || !validGuids?.size) {
+		return out;
+	}
+	for (const doc of collectHitTestDocuments(panel, range)) {
+		let stack;
+		try {
+			stack = doc.elementsFromPoint?.(cx, cy);
+		} catch (_) {
+			continue;
+		}
+		for (const el of stack || []) {
+			if (panelRoots?.length && !panelRoots.some((r) => rootContainsDeep(r, el))) continue;
+			for (const g of guidsFromAncestorsDeep(el, validGuids)) out.add(g);
+		}
+	}
+	return out;
 }
 
 /** `document.elementFromPoint` on the wrong document only sees the outer page — misses iframe/shadow content entirely. */
@@ -2624,8 +2637,9 @@ function rememberFrozenTextSelectionRange(plugin, panel) {
 }
 
 /**
- * Updates the persistent “last highlighted text” line set (non-collapsed DOM selection only).
- * Opening the palette often collapses the selection; we do not clear this cache on collapse.
+ * Updates plugin._lastTextSelectionLineGuids from DOM geometry. When the command palette has focus,
+ * live Selection in the editor may be missing or collapsed — this still runs using _frozenTextSelection,
+ * _lastNonCollapsedSelectionUnion, and pointer band fallbacks (no early exit only because rangeCount is 0).
  */
 async function captureTextSelectionLinesForCommands(plugin, panel) {
 	if (!plugin || !panel || panel.getType?.() !== PANEL_TYPE_EDITOR) {
@@ -2635,26 +2649,27 @@ async function captureTextSelectionLinesForCommands(plugin, panel) {
 		return;
 	}
 	const sel = getEditorDomSelection(panel);
-	if (!sel?.rangeCount) {
-		return;
-	}
-	const liveRange = sel.getRangeAt(0);
+	let liveRange = null;
+	try {
+		if (sel?.rangeCount) liveRange = sel.getRangeAt(0);
+	} catch (_) {}
 	const frozenRef = plugin._frozenTextSelection;
 	let rangeSnap = null;
-	if (!liveRange.collapsed) {
+	if (liveRange && !liveRange.collapsed) {
 		try {
 			rangeSnap = liveRange.cloneRange();
 			try {
 				plugin._frozenTextSelection = { range: rangeSnap.cloneRange(), t: Date.now() };
 			} catch (_) {}
 		} catch (_) {
-			return;
+			rangeSnap = null;
 		}
-	} else if (frozenRef && Date.now() - frozenRef.t < FROZEN_TEXT_SELECTION_MS) {
+	}
+	if (!rangeSnap && frozenRef && Date.now() - frozenRef.t < FROZEN_TEXT_SELECTION_MS) {
 		try {
 			rangeSnap = frozenRef.range.cloneRange();
 		} catch (_) {
-			return;
+			rangeSnap = null;
 		}
 	}
 	let unionSnap = rangeSnap ? getRangeClientRectUnion(rangeSnap) : null;
@@ -2702,7 +2717,10 @@ async function captureTextSelectionLinesForCommands(plugin, panel) {
 	const valid = new Set(items.map((it) => it.guid));
 	let allowCapture =
 		(rangeSnap && rangeLikelyInEditorRoots(rangeSnap, roots)) ||
-		(!liveRange.collapsed && selectionLikelyInEditorRoots(sel, roots)) ||
+		(liveRange &&
+			!liveRange.collapsed &&
+			sel &&
+			selectionLikelyInEditorRoots(sel, roots)) ||
 		(unionSnap && clientUnionIntersectsAnyRoot(unionSnap, roots)) ||
 		(bandY0 != null && bandY1 != null);
 	if (!allowCapture && rangeSnap) {
@@ -2739,9 +2757,9 @@ async function captureTextSelectionLinesForCommands(plugin, panel) {
 	if (rangeSnap) {
 		for (const g of guidsFromAncestorsDeep(rangeSnap.startContainer, valid)) merged.add(g);
 		for (const g of guidsFromAncestorsDeep(rangeSnap.endContainer, valid)) merged.add(g);
-		for (const g of lineGuidsFromDomTextSelectionRange(rangeSnap, valid, items)) merged.add(g);
-		for (const g of lineGuidsFromRangePointSamplingRange(rangeSnap, valid)) merged.add(g);
-		for (const g of lineGuidsFromVerticalStackSweepRange(rangeSnap, valid, roots)) merged.add(g);
+		for (const g of lineGuidsFromDomTextSelectionRange(rangeSnap, valid, items, panel)) merged.add(g);
+		for (const g of lineGuidsFromRangePointSamplingRange(rangeSnap, valid, panel, roots)) merged.add(g);
+		for (const g of lineGuidsFromVerticalStackSweepRange(rangeSnap, valid, roots, panel)) merged.add(g);
 	}
 
 	const rectsRows = rangeSnap
@@ -2792,6 +2810,8 @@ async function captureTextSelectionLinesForCommands(plugin, panel) {
 	}
 	if (merged.size) {
 		plugin._lastTextSelectionLineGuids = merged;
+	} else {
+		plugin._lastTextSelectionLineGuids = new Set();
 	}
 	if (unionSnap && (unionSnap.maxX > unionSnap.minX || unionSnap.maxY > unionSnap.minY)) {
 		plugin._lastNonCollapsedSelectionUnion = {
@@ -3346,6 +3366,10 @@ class Plugin extends AppPlugin {
 			scope === "selection" ? getEditorPanelForSelection(this.ui) ?? active : active;
 		if (scope === "selection") {
 			rememberFrozenTextSelectionRange(this, panel);
+			this._lastTextSelectionLineGuids = new Set();
+			if (typeof requestAnimationFrame !== "undefined") {
+				await new Promise((r) => requestAnimationFrame(() => r()));
+			}
 			await captureTextSelectionLinesForCommands(this, panel);
 			await snapshotEditorSelectionInto(this, panel);
 		}
@@ -3356,6 +3380,11 @@ class Plugin extends AppPlugin {
 		const selectedSet = getSelectedLineItemGuidSet(panel, items, this, record);
 
 		if (scope === "selection" && (!selectedSet || !selectedSet.size)) {
+			highlighterToaster(
+				this.ui,
+				"No lines matched the current selection. Select text in the note body first, then run the command (the palette often clears the live selection—we also use a saved range when possible).",
+				{ autoDestroyTime: 9000 },
+			);
 			return;
 		}
 
