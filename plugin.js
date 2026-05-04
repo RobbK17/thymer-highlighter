@@ -5,9 +5,10 @@
  * is applied without editing.
  * \\ escapes backslash; \\== and \\= emit literal == and =; \\== prevents a pair from being a delimiter.
  * Multi-line ==…== is supported across consecutive single-segment lines of the same type (text/bold/italic).
- * Within one line, consecutive text/bold/italic segments are parsed together so == survives Thymer splitting **…**.
- * For **plain text**, both "=" of an opener/closer must sit in the same segment (avoids `foo=` + `=bar` false pairs).
- * For **bold** or **italic**, adjacent cells may split "==" across the boundary (`=` | `=…`) and still pair.
+ * Within one line, consecutive text/bold/italic segments are parsed together; a single ==…== span may span
+ * mixed segment types (e.g. bold then italic then plain) — stored as adjacent highlight linkobjs with
+ * per-chunk sourceSegmentType / href #st=. Cross-segment **==** is disallowed only for two adjacent **text**
+ * cells (avoids `foo=` + `=bar` false pairs). For **bold** or **italic**, adjacent cells may split "==" across the boundary (`=` | `=…`).
  * Syntax blocks skip conversion: rows with `getHighlightLanguage`, children of a `block` row with `meta_properties.language`, and Thymer `quote` (email blockquote) rows; inline `code` segments were already skipped.
  *
  * “Selected lines” matches Thymer’s text workflow: we keep the line GUIDs for the current editor
@@ -18,7 +19,7 @@
  */
 
 /** Release version; keep in sync with the `version` field in plugin.json. */
-const PLUGIN_VERSION = "1.0.5";
+const PLUGIN_VERSION = "1.0.6";
 
 const LS_KEY_HIGHLIGHT_DETECTION = "thymerHighlighter:highlightDetection";
 
@@ -157,9 +158,9 @@ function findNextUnescapedEqEq(str, from) {
 /**
  * Like findNextUnescapedEqEq, but only when both "=" are allowed as a pair:
  * - Both come from the same Thymer segment (`map`), or
- * - They straddle the join between adjacent segments with the **same** type and
- *   that type is **bold** or **italic** (Thymer often splits "==" across two bold/italic cells).
- *   Plain **text** stays same-segment only so `foo=` + `=bar` does not become a false pair.
+ * - They straddle the join between adjacent splittable segments when **not** both plain **text**
+ *   (avoids `foo=` + `=bar` across two text cells). Mixed **text|bold|italic** boundaries are allowed
+ *   so one highlight can span differently styled portions.
  * @param {{ si: number }[]} map from buildRunCombined (or cross-line chain map)
  * @param {{ type?: string }[] | null} run parallel to map segment indices; required for cross-segment pairs
  */
@@ -173,8 +174,11 @@ function findNextUnescapedEqEqInRun(str, from, map, run) {
 		if (!run?.length || b.si !== a.si + 1) continue;
 		const ta = run[a.si]?.type;
 		const tb = run[b.si]?.type;
-		if (ta !== tb) continue;
-		if (ta === "bold" || ta === "italic") return p;
+		const splittableA = ta === "text" || ta === "bold" || ta === "italic";
+		const splittableB = tb === "text" || tb === "bold" || tb === "italic";
+		if (!splittableA || !splittableB) continue;
+		if (ta === "text" && tb === "text") continue;
+		return p;
 	}
 	return -1;
 }
@@ -316,6 +320,42 @@ function emitTextSubrangesFromRun(run, combined, map, rs, re, out) {
 }
 
 /**
+ * One ==…== span may cover text/bold/italic sub-ranges; emit one linkobj per contiguous same-segment slice
+ * so styling (#st=bold / italic) matches each portion.
+ */
+function emitHighlightSubrangesFromRun(run, combined, map, rs, re, out) {
+	let pos = rs;
+	while (pos < re) {
+		const m = map[pos];
+		if (!m || m.si < 0) {
+			pos++;
+			continue;
+		}
+		const si = m.si;
+		let endPos = pos;
+		while (endPos < re && map[endPos] && map[endPos].si === si) endPos++;
+		const slice = combined.slice(pos, endPos);
+		if (!slice.length) {
+			pos = endPos;
+			continue;
+		}
+		const st =
+			run[si].type === "bold" || run[si].type === "italic" || run[si].type === "text"
+				? run[si].type
+				: "text";
+		out.push({
+			type: "linkobj",
+			text: {
+				link: highlightHrefForSourceType(st),
+				title: unescapeText(slice),
+				sourceSegmentType: st,
+			},
+		});
+		pos = endPos;
+	}
+}
+
+/**
  * Parse == across a maximal run of text/bold/italic segments (Thymer often splits **…** into several segments).
  */
 function expandSplittableRun(run) {
@@ -329,21 +369,7 @@ function expandSplittableRun(run) {
 	for (const r of ranges) {
 		if (r.start >= r.end) continue;
 		if (r.kind === "highlight") {
-			const m0 = map[r.start];
-			const st =
-				m0 &&
-				m0.si >= 0 &&
-				(run[m0.si].type === "text" || run[m0.si].type === "bold" || run[m0.si].type === "italic")
-					? run[m0.si].type
-					: "text";
-			out.push({
-				type: "linkobj",
-				text: {
-					link: highlightHrefForSourceType(st),
-					title: unescapeText(combined.slice(r.start, r.end)),
-					sourceSegmentType: st,
-				},
-			});
+			emitHighlightSubrangesFromRun(run, combined, map, r.start, r.end, out);
 		} else {
 			emitTextSubrangesFromRun(run, combined, map, r.start, r.end, out);
 		}
@@ -646,7 +672,8 @@ function inlineStyleNeighborBeyondWhitespace(segments, highlightIndex, delta) {
 
 /**
  * After Thymer toggles bold/italic on a range, highlight linkobjs stay separate segments with a stale
- * sourceSegmentType. Align that field with neighboring text/bold/italic segments.
+ * sourceSegmentType. Align that field with neighboring text/bold/italic segments. Contiguous runs of our
+ * highlight linkobjs (mixed formatting inside one == span) are left unchanged so per-chunk #st= survives.
  * @returns {{ segments: object[], changed: boolean }}
  */
 function syncHighlightSourceTypesWithNeighbors(segments) {
@@ -659,6 +686,12 @@ function syncHighlightSourceTypesWithNeighbors(segments) {
 			next.push(s);
 			continue;
 		}
+		const prevHl = i > 0 && isOurHighlightSegment(segments[i - 1]);
+		const nextHl = i < segments.length - 1 && isOurHighlightSegment(segments[i + 1]);
+		if (prevHl || nextHl) {
+			next.push(s);
+			continue;
+		}
 		const lt = inlineStyleNeighborBeyondWhitespace(segments, i, -1);
 		const rt = inlineStyleNeighborBeyondWhitespace(segments, i, 1);
 		let inferred = "text";
@@ -667,7 +700,7 @@ function syncHighlightSourceTypesWithNeighbors(segments) {
 			if (lt === "bold" || rt === "bold") inferred = "bold";
 			else if (lt === "italic" || rt === "italic") inferred = "italic";
 			else inferred = lt;
-		} 		else if (lt) inferred = lt;
+		} else if (lt) inferred = lt;
 		else if (rt) inferred = rt;
 		const canonical = highlightHrefForSourceType(inferred);
 		const prevSt = s.text.sourceSegmentType ?? "text";
@@ -1085,20 +1118,42 @@ function transformSegmentsUnwrap(segments, mode) {
 	if (!segments || !segments.length) return null;
 	const out = [];
 	let changed = false;
-	for (const seg of segments) {
-		if (isOurHighlightSegment(seg)) {
-			changed = true;
-			const title = highlightLinkTitle(seg);
-			const outType = highlightStoredSourceType(seg);
-			if (mode === "plain") {
+	let i = 0;
+	while (i < segments.length) {
+		const seg = segments[i];
+		if (!isOurHighlightSegment(seg)) {
+			out.push({ type: seg.type, text: seg.text });
+			i++;
+			continue;
+		}
+		changed = true;
+		let j = i;
+		const run = [];
+		while (j < segments.length && isOurHighlightSegment(segments[j])) {
+			run.push(segments[j]);
+			j++;
+		}
+		if (mode === "plain") {
+			for (const h of run) {
+				const title = highlightLinkTitle(h);
+				const outType = highlightStoredSourceType(h);
 				if (title.length) out.push({ type: outType, text: title });
-			} else {
-				const inner = escapeInnerForMarkers(title);
-				out.push({ type: outType, text: `==${inner}==` });
 			}
 		} else {
-			out.push({ type: seg.type, text: seg.text });
+			const types = run.map(highlightStoredSourceType);
+			const titles = run.map(highlightLinkTitle);
+			const allSame = types.every((t) => t === types[0]);
+			if (allSame) {
+				const inner = escapeInnerForMarkers(titles.join(""));
+				out.push({ type: types[0], text: `==${inner}==` });
+			} else {
+				for (let k = 0; k < run.length; k++) {
+					const inner = escapeInnerForMarkers(titles[k]);
+					out.push({ type: types[k], text: `==${inner}==` });
+				}
+			}
 		}
+		i = j;
 	}
 	if (!changed) return null;
 	if (!out.length) return [{ type: "text", text: "" }];
@@ -1299,14 +1354,28 @@ a[href^="${L}"] {
 	background-color: #fdf0d4;
 	border: 1px solid #ead6b2;
 	border-radius: 3px;
-	padding: 0.1em 0.32em;
-	margin: 0 0.04em;
+	padding: 0.06em 0.18em;
+	margin: 0;
 	color: #5c4819 !important;
 	text-decoration: none !important;
 	box-decoration-break: clone;
 	-webkit-box-decoration-break: clone;
 	cursor: inherit;
 	pointer-events: none;
+}
+/* One logical ==…== may be several adjacent linkobjs (mixed bold/italic/plain) — seam inner edges */
+a[href^="${L}"]:has(+ a[href^="${L}"]) {
+	border-right: none;
+	border-top-right-radius: 0;
+	border-bottom-right-radius: 0;
+	padding-right: 0.08em;
+}
+a[href^="${L}"] + a[href^="${L}"] {
+	border-left: none;
+	border-top-left-radius: 0;
+	border-bottom-left-radius: 0;
+	padding-left: 0.08em;
+	margin-left: -1px;
 }
 /* When Thymer does not wrap linkobjs in strong/em, href carries #st=bold | #st=italic (see highlightHrefForSourceType). */
 a[href^="${L}#st=bold"] {
